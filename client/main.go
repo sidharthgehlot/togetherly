@@ -1,8 +1,13 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"math"
 	"math/rand"
@@ -34,6 +39,7 @@ const (
 	wmClose         = 0x0010
 	wmTrayIcon      = 0x8001
 	wmLButtonUp     = 0x0202
+	wmSetIcon       = 0x0080
 	gwlpWndProc     = ^uintptr(3)
 	swHide          = 0
 	swRestore       = 9
@@ -43,6 +49,10 @@ const (
 	nifIcon         = 2
 	nifTip          = 4
 	idiApp          = uintptr(32512)
+	iconSmall       = 0
+	iconBig         = 1
+	imageIcon       = 1
+	lrLoadFromFile  = 0x00000010
 )
 
 // ── Win32 ─────────────────────────────────────────────────────────────────────
@@ -57,8 +67,13 @@ var (
 	showWin       = user32.NewProc("ShowWindow")
 	setForeground = user32.NewProc("SetForegroundWindow")
 	loadIcon      = user32.NewProc("LoadIconW")
+	loadImage     = user32.NewProc("LoadImageW")
+	sendMessage   = user32.NewProc("SendMessageW")
 	shellNotify   = shell32.NewProc("Shell_NotifyIconW")
 )
+
+// gAppIcon holds the HICON we generate from a heart shape at startup.
+var gAppIcon uintptr
 
 type notifyIconData struct {
 	CbSize           uint32
@@ -308,10 +323,92 @@ func connectAndSync(code string, isHost bool) {
 	}
 }
 
+// ── Heart icon (generated at runtime, no .ico file needed) ───────────────────
+
+// makeHeartIcon writes a heart-shaped .ico file to temp dir and returns the path.
+// The shape uses the parametric heart curve: (x²+y²-1)³ - x²y³ < 0.
+func makeHeartIcon() (string, error) {
+	const sz = 32
+	img := image.NewRGBA(image.Rect(0, 0, sz, sz))
+
+	// Center the heart, scale so it fits comfortably with breathing room
+	cx, cy := float64(sz)/2-0.5, float64(sz)/2+1
+	scale := float64(sz) * 0.40
+
+	for y := 0; y < sz; y++ {
+		for x := 0; x < sz; x++ {
+			fx := (float64(x) - cx) / scale
+			fy := -(float64(y) - cy) / scale
+			xx := fx * fx
+			v := math.Pow(xx+fy*fy-1, 3) - xx*math.Pow(fy, 3)
+
+			if v < 0 {
+				// Pink → purple gradient based on diagonal position
+				t := (float64(x) + float64(y)) / float64(2*sz)
+				r := uint8(236 + (168-236)*t) // ec → a8
+				g := uint8(72 + (85-72)*t)
+				b := uint8(153 + (247-153)*t) // 99 → f7
+				img.Set(x, y, color.RGBA{r, g, b, 255})
+			}
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return "", err
+	}
+	pngData := buf.Bytes()
+
+	// Wrap PNG in .ico container (Vista+ supports PNG-encoded icons)
+	var ico bytes.Buffer
+	binary.Write(&ico, binary.LittleEndian, uint16(0)) // reserved
+	binary.Write(&ico, binary.LittleEndian, uint16(1)) // type ICO
+	binary.Write(&ico, binary.LittleEndian, uint16(1)) // count
+	ico.WriteByte(sz)
+	ico.WriteByte(sz)
+	ico.WriteByte(0) // colors
+	ico.WriteByte(0) // reserved
+	binary.Write(&ico, binary.LittleEndian, uint16(1))               // planes
+	binary.Write(&ico, binary.LittleEndian, uint16(32))              // bpp
+	binary.Write(&ico, binary.LittleEndian, uint32(len(pngData)))    // bytes
+	binary.Write(&ico, binary.LittleEndian, uint32(22))              // offset
+	ico.Write(pngData)
+
+	icoPath := filepath.Join(os.TempDir(), "togetherly.ico")
+	if err := os.WriteFile(icoPath, ico.Bytes(), 0644); err != nil {
+		return "", err
+	}
+	return icoPath, nil
+}
+
+// loadIconFromFile loads an .ico file and returns its HICON.
+func loadIconFromFile(path string) uintptr {
+	pathPtr, _ := windows.UTF16PtrFromString(path)
+	icon, _, _ := loadImage.Call(
+		0,
+		uintptr(unsafe.Pointer(pathPtr)),
+		imageIcon,
+		32, 32,
+		lrLoadFromFile,
+	)
+	return icon
+}
+
+func setWindowIcon(hwnd, icon uintptr) {
+	if icon == 0 {
+		return
+	}
+	sendMessage.Call(hwnd, wmSetIcon, iconSmall, icon)
+	sendMessage.Call(hwnd, wmSetIcon, iconBig, icon)
+}
+
 // ── Tray + window subclass ───────────────────────────────────────────────────
 
 func addTrayIcon(hwnd uintptr) {
-	icon, _, _ := loadIcon.Call(0, idiApp)
+	icon := gAppIcon
+	if icon == 0 {
+		icon, _, _ = loadIcon.Call(0, idiApp)
+	}
 	var nid notifyIconData
 	nid.CbSize = uint32(unsafe.Sizeof(nid))
 	nid.HWnd = hwnd
@@ -349,6 +446,7 @@ func wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 }
 
 func hookWindow(hwnd uintptr) {
+	setWindowIcon(hwnd, gAppIcon)
 	addTrayIcon(hwnd)
 	cb := syscall.NewCallback(wndProc)
 	r, _, _ := getWinLong.Call(hwnd, gwlpWndProc)
@@ -360,6 +458,11 @@ func hookWindow(hwnd uintptr) {
 
 func main() {
 	runtime.LockOSThread()
+
+	// Generate the heart icon and load it as an HICON
+	if icoPath, err := makeHeartIcon(); err == nil {
+		gAppIcon = loadIconFromFile(icoPath)
+	}
 
 	// Local HTTP server serving the UI (more reliable than SetHtml)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -459,11 +562,6 @@ const htmlUI = `<!DOCTYPE html>
     height: 56px;
     margin-bottom: 10px;
     filter: drop-shadow(0 6px 14px rgba(190, 24, 93, 0.22));
-    animation: float 3.4s ease-in-out infinite;
-  }
-  @keyframes float {
-    0%, 100% { transform: translateY(0) rotate(0deg); }
-    50%      { transform: translateY(-5px) rotate(-2deg); }
   }
 
   h1 {
@@ -474,7 +572,8 @@ const htmlUI = `<!DOCTYPE html>
     -webkit-text-fill-color: transparent;
     background-clip: text;
     letter-spacing: -1.2px;
-    line-height: 1;
+    line-height: 1.2;
+    padding-bottom: 2px;
   }
 
   .tagline {
