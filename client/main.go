@@ -6,17 +6,20 @@ import (
 	"io"
 	"math"
 	"math/rand"
-	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+	"unsafe"
 
+	webview "github.com/jchv/go-webview2"
 	"github.com/gorilla/websocket"
+	"golang.org/x/sys/windows"
 )
 
 const (
@@ -25,30 +28,80 @@ const (
 	pollInterval  = 500 * time.Millisecond
 	seekThreshold = 3.0
 	serverURL     = "wss://togetherly-eqpo.onrender.com/ws"
+
+	// Win32
+	wmClose      = 0x0010
+	wmTrayIcon   = 0x8001 // WM_APP + 1
+	wmLButtonUp  = 0x0202
+	gwlpWndProc  = ^uintptr(3) // -4
+	swHide       = 0
+	swRestore    = 9
+	nimAdd       = 0
+	nimDelete    = 2
+	nifMessage   = 1
+	nifIcon      = 2
+	nifTip       = 4
+	idiApp       = uintptr(32512)
 )
 
-// ── UI connection ─────────────────────────────────────────────────────────────
+// ── Win32 lazy procs ──────────────────────────────────────────────────────────
 
 var (
-	uiMu   sync.Mutex
-	uiConn *websocket.Conn
+	user32   = windows.NewLazySystemDLL("user32.dll")
+	shell32  = windows.NewLazySystemDLL("shell32.dll")
+
+	setWinLong   = user32.NewProc("SetWindowLongPtrW")
+	getWinLong   = user32.NewProc("GetWindowLongPtrW")
+	callWinProc  = user32.NewProc("CallWindowProcW")
+	showWin      = user32.NewProc("ShowWindow")
+	setForeground = user32.NewProc("SetForegroundWindow")
+	loadIcon     = user32.NewProc("LoadIconW")
+	shellNotify  = shell32.NewProc("Shell_NotifyIconW")
 )
 
-func sendUI(msg map[string]interface{}) {
-	uiMu.Lock()
-	defer uiMu.Unlock()
-	if uiConn != nil {
-		data, _ := json.Marshal(msg)
-		uiConn.WriteMessage(websocket.TextMessage, data)
-	}
+// notifyIconData maps to NOTIFYICONDATAW
+type notifyIconData struct {
+	CbSize           uint32
+	HWnd             uintptr
+	UID              uint32
+	UFlags           uint32
+	UCallbackMessage uint32
+	HIcon            uintptr
+	SzTip            [128]uint16
+	DwState          uint32
+	DwStateMask      uint32
+	SzInfo           [256]uint16
+	UVersion         uint32
+	SzInfoTitle      [64]uint16
+	DwInfoFlags      uint32
+	_                [4]byte // GUID padding
 }
 
-// ── Loop prevention ───────────────────────────────────────────────────────────
+// ── Global state ──────────────────────────────────────────────────────────────
 
 var (
+	gView       webview.WebView
+	gHWND       uintptr
+	origWndProc uintptr
+
 	ignoreMu    sync.Mutex
 	ignoreUntil time.Time
 )
+
+// ── UI helpers ────────────────────────────────────────────────────────────────
+
+func evalUI(js string) {
+	if gView != nil {
+		gView.Dispatch(func() { gView.Eval(js) })
+	}
+}
+
+func jsStr(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+// ── Loop prevention ───────────────────────────────────────────────────────────
 
 func isIgnoring() bool {
 	ignoreMu.Lock()
@@ -113,10 +166,7 @@ func applyEvent(e syncEvent) {
 			vlcCommand("command=pl_pause")
 		}
 	}
-	sendUI(map[string]interface{}{
-		"type": "sync_event", "direction": "received",
-		"event": e.Type, "time": fmtTime(e.Time),
-	})
+	evalUI(fmt.Sprintf("syncEvent('recv',%s,%s)", jsStr(e.Type), jsStr(fmtTime(e.Time))))
 }
 
 // ── VLC auto-setup ────────────────────────────────────────────────────────────
@@ -156,40 +206,46 @@ func autoConfigureVLC() error {
 	return os.WriteFile(path, []byte(content), 0644)
 }
 
-// watchVLC continuously checks VLC and updates the UI dot
 func watchVLC() {
 	configured := false
 	for {
 		if _, err := getVLCStatus(); err == nil {
-			sendUI(map[string]interface{}{"type": "vlc_status", "connected": true})
+			evalUI("vlcStatus(true, 'VLC connected')")
 			time.Sleep(3 * time.Second)
 			continue
 		}
 		if !configured {
 			autoConfigureVLC()
 			configured = true
-			sendUI(map[string]interface{}{
-				"type": "vlc_status", "connected": false,
-				"message": "VLC ready — please restart VLC, then it'll connect automatically",
-			})
-		} else {
-			sendUI(map[string]interface{}{
-				"type": "vlc_status", "connected": false,
-				"message": "Waiting for VLC...",
-			})
 		}
+		evalUI("vlcStatus(false, 'Waiting for VLC — please open VLC')")
 		time.Sleep(2 * time.Second)
 	}
 }
 
 // ── Sync loop ─────────────────────────────────────────────────────────────────
 
-func runSync(renderConn *websocket.Conn) {
+func connectAndSync(code string, isHost bool) {
+	if isHost {
+		evalUI(fmt.Sprintf("roomCreated(%s)", jsStr(code)))
+	} else {
+		evalUI(fmt.Sprintf("roomJoined(%s)", jsStr(code)))
+	}
+
+	conn, _, err := websocket.DefaultDialer.Dial(serverURL, nil)
+	if err != nil {
+		evalUI(fmt.Sprintf("showError(%s)", jsStr("Cannot reach server — check internet")))
+		return
+	}
+
+	join, _ := json.Marshal(map[string]string{"type": "join", "room": code})
+	conn.WriteMessage(websocket.TextMessage, join)
+
 	go func() {
 		for {
-			_, msg, err := renderConn.ReadMessage()
+			_, msg, err := conn.ReadMessage()
 			if err != nil {
-				sendUI(map[string]interface{}{"type": "server_disconnected"})
+				evalUI("showError('Disconnected from server')")
 				return
 			}
 			var raw map[string]interface{}
@@ -197,7 +253,7 @@ func runSync(renderConn *websocket.Conn) {
 				continue
 			}
 			if raw["type"] == "partner_joined" {
-				sendUI(map[string]interface{}{"type": "partner_joined"})
+				evalUI("partnerJoined()")
 				continue
 			}
 			var e syncEvent
@@ -217,7 +273,6 @@ func runSync(renderConn *websocket.Conn) {
 		if err != nil {
 			continue
 		}
-
 		now := time.Now()
 		cur := float64(s.Time)
 
@@ -251,96 +306,102 @@ func runSync(renderConn *websocket.Conn) {
 
 		if event != nil {
 			data, _ := json.Marshal(event)
-			renderConn.WriteMessage(websocket.TextMessage, data)
-			sendUI(map[string]interface{}{
-				"type": "sync_event", "direction": "sent",
-				"event": event.Type, "time": fmtTime(event.Time),
-			})
+			conn.WriteMessage(websocket.TextMessage, data)
+			evalUI(fmt.Sprintf("syncEvent('sent',%s,%s)", jsStr(event.Type), jsStr(fmtTime(event.Time))))
 		}
 
 		lastState, lastTime, lastTick = s.State, cur, now
 	}
 }
 
-// ── HTTP + UI WebSocket ───────────────────────────────────────────────────────
+// ── Tray icon ─────────────────────────────────────────────────────────────────
 
-var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-
-func handleUI(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		return
-	}
-
-	uiMu.Lock()
-	uiConn = conn
-	uiMu.Unlock()
-
-	for {
-		_, msg, err := conn.ReadMessage()
-		if err != nil {
-			uiMu.Lock()
-			uiConn = nil
-			uiMu.Unlock()
-			return
-		}
-
-		var cmd map[string]string
-		if json.Unmarshal(msg, &cmd) != nil {
-			continue
-		}
-
-		switch cmd["type"] {
-		case "create_room":
-			code := fmt.Sprintf("%04d", rand.Intn(10000))
-			go connectToServer(code, true)
-		case "join_room":
-			go connectToServer(cmd["code"], false)
-		}
-	}
+func addTrayIcon(hwnd uintptr) {
+	icon, _, _ := loadIcon.Call(0, idiApp)
+	var nid notifyIconData
+	nid.CbSize = uint32(unsafe.Sizeof(nid))
+	nid.HWnd = hwnd
+	nid.UID = 1
+	nid.UFlags = nifMessage | nifIcon | nifTip
+	nid.UCallbackMessage = wmTrayIcon
+	nid.HIcon = icon
+	tip := windows.StringToUTF16("togetherly — click to open")
+	copy(nid.SzTip[:], tip)
+	shellNotify.Call(nimAdd, uintptr(unsafe.Pointer(&nid)))
 }
 
-func connectToServer(code string, isHost bool) {
-	if isHost {
-		sendUI(map[string]interface{}{"type": "room_created", "code": code})
-	} else {
-		sendUI(map[string]interface{}{"type": "room_joined", "code": code})
-	}
+func removeTrayIcon(hwnd uintptr) {
+	var nid notifyIconData
+	nid.CbSize = uint32(unsafe.Sizeof(nid))
+	nid.HWnd = hwnd
+	nid.UID = 1
+	shellNotify.Call(nimDelete, uintptr(unsafe.Pointer(&nid)))
+}
 
-	conn, _, err := websocket.DefaultDialer.Dial(serverURL, nil)
-	if err != nil {
-		sendUI(map[string]interface{}{
-			"type": "error", "message": "Cannot reach server — check your internet",
-		})
-		return
-	}
+// ── Window subclass ───────────────────────────────────────────────────────────
 
-	join, _ := json.Marshal(map[string]string{"type": "join", "room": code})
-	conn.WriteMessage(websocket.TextMessage, join)
-	runSync(conn)
+func wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
+	switch msg {
+	case wmClose:
+		// Hide to tray instead of closing
+		showWin.Call(hwnd, swHide)
+		return 0
+	case wmTrayIcon:
+		if lParam == wmLButtonUp {
+			showWin.Call(hwnd, swRestore)
+			setForeground.Call(hwnd)
+		}
+		return 0
+	}
+	r, _, _ := callWinProc.Call(origWndProc, hwnd, msg, wParam, lParam)
+	return r
+}
+
+func hookWindow(hwnd uintptr) {
+	addTrayIcon(hwnd)
+	cb := syscall.NewCallback(wndProc)
+	r, _, _ := getWinLong.Call(hwnd, gwlpWndProc)
+	origWndProc = r
+	setWinLong.Call(hwnd, gwlpWndProc, cb)
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 func main() {
-	listener, _ := net.Listen("tcp", "127.0.0.1:0")
-	port := listener.Addr().(*net.TCPAddr).Port
-	url := fmt.Sprintf("http://127.0.0.1:%d", port)
+	runtime.LockOSThread()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(htmlUI))
+	w := webview.New(false)
+	defer func() {
+		removeTrayIcon(gHWND)
+		w.Destroy()
+	}()
+	gView = w
+
+	w.SetTitle("togetherly")
+	w.SetSize(380, 520, webview.HintFixed)
+	w.SetHtml(htmlUI)
+
+	w.Bind("go_createRoom", func() {
+		code := fmt.Sprintf("%04d", rand.Intn(10000))
+		go connectAndSync(code, true)
 	})
-	mux.HandleFunc("/ui", handleUI)
+	w.Bind("go_joinRoom", func(code string) {
+		go connectAndSync(code, false)
+	})
+	w.Bind("go_quit", func() {
+		removeTrayIcon(gHWND)
+		w.Terminate()
+	})
 
-	go http.Serve(listener, mux)
+	// Hook window after first event loop tick (window is created by then)
+	w.Dispatch(func() {
+		gHWND = uintptr(w.Window())
+		hookWindow(gHWND)
+	})
+
 	go watchVLC()
 
-	exec.Command("cmd", "/c", "start", url).Start()
-
-	fmt.Printf("togetherly running at %s\nPress Ctrl+C to quit.\n", url)
-	select {}
+	w.Run()
 }
 
 func fmtTime(secs float64) string {
@@ -348,304 +409,216 @@ func fmtTime(secs float64) string {
 	return fmt.Sprintf("%d:%02d:%02d", s/3600, (s%3600)/60, s%60)
 }
 
-// ── UI ────────────────────────────────────────────────────────────────────────
+// ── HTML UI ───────────────────────────────────────────────────────────────────
 
 const htmlUI = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>togetherly</title>
 <style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { height:100%; }
 
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     background: #fdf2f8;
-    min-height: 100vh;
     display: flex;
+    flex-direction: column;
     align-items: center;
     justify-content: center;
-  }
-
-  .card {
-    background: #fff;
-    border-radius: 28px;
-    padding: 40px 36px;
-    width: 360px;
-    box-shadow: 0 12px 48px rgba(194,24,91,0.12);
-    text-align: center;
+    padding: 32px 28px;
+    gap: 0;
+    user-select: none;
+    -webkit-user-select: none;
   }
 
   h1 {
-    font-size: 30px;
-    font-weight: 800;
+    font-size: 34px;
+    font-weight: 900;
     background: linear-gradient(135deg, #e91e63, #9c27b0);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;
-    letter-spacing: -1px;
+    letter-spacing: -1.5px;
+    margin-bottom: 4px;
   }
 
   .tagline {
-    font-size: 13px;
-    color: #bbb;
-    margin-top: 4px;
-    margin-bottom: 28px;
+    font-size: 12px;
+    color: #ccc;
+    margin-bottom: 24px;
+    letter-spacing: 0.3px;
   }
 
-  /* VLC status pill */
-  .vlc-pill {
+  /* VLC pill */
+  .pill {
     display: inline-flex;
     align-items: center;
     gap: 7px;
-    background: #f5f5f5;
-    border-radius: 20px;
     padding: 6px 14px;
+    border-radius: 20px;
+    background: #f0f0f0;
     font-size: 12px;
-    color: #777;
+    color: #999;
     margin-bottom: 28px;
     transition: all 0.3s;
   }
-  .vlc-pill.ok { background: #e8f5e9; color: #388e3c; }
-  .vlc-pill.err { background: #fce4ec; color: #c62828; }
-
+  .pill.ok  { background: #e8f5e9; color: #2e7d32; }
+  .pill.err { background: #fce4ec; color: #b71c1c; }
   .dot {
-    width: 7px; height: 7px;
-    border-radius: 50%;
-    background: #ccc;
-    flex-shrink: 0;
+    width: 7px; height: 7px; border-radius: 50%; background: #ccc; flex-shrink: 0;
   }
-  .ok .dot { background: #4caf50; }
-  .err .dot { background: #e53935; animation: blink 1.4s infinite; }
-
-  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+  .ok  .dot { background: #43a047; }
+  .err .dot { background: #e53935; animation: blink 1.2s infinite; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.25} }
 
   /* Buttons */
   .btn {
-    width: 100%;
-    padding: 15px;
-    border-radius: 16px;
-    border: none;
-    font-size: 15px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: all 0.18s;
+    width: 100%; padding: 14px; border-radius: 14px; border: none;
+    font-size: 15px; font-weight: 600; cursor: pointer; transition: all .15s;
     margin-bottom: 10px;
   }
   .btn:last-child { margin-bottom: 0; }
-
-  .btn-primary {
-    background: linear-gradient(135deg, #f06292, #ab47bc);
+  .btn-pink {
+    background: linear-gradient(135deg, #f06292, #c2185b);
     color: #fff;
-    box-shadow: 0 4px 16px rgba(194,24,91,0.2);
+    box-shadow: 0 4px 14px rgba(194,24,91,.22);
   }
-  .btn-primary:hover:not(:disabled) {
-    transform: translateY(-2px);
-    box-shadow: 0 8px 24px rgba(194,24,91,0.3);
+  .btn-purple {
+    background: linear-gradient(135deg, #ce93d8, #7b1fa2);
+    color: #fff;
+    box-shadow: 0 4px 14px rgba(123,31,162,.2);
   }
-  .btn-primary:disabled { opacity: 0.45; cursor: default; }
-
+  .btn-pink:hover   { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(194,24,91,.32); }
+  .btn-purple:hover { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(123,31,162,.28); }
   .btn-ghost {
-    background: transparent;
-    color: #aaa;
-    font-size: 13px;
-    padding: 10px;
+    background: none; color: #bbb; font-size: 13px; padding: 8px;
   }
-  .btn-ghost:hover { color: #888; }
+  .btn-ghost:hover { color: #999; }
 
-  /* Code display */
+  /* Code box */
   .code-box {
     background: linear-gradient(135deg, #fce4ec, #f3e5f5);
-    border-radius: 20px;
-    padding: 24px 20px 18px;
-    margin: 4px 0 20px;
-  }
-  .code-label {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 1.5px;
-    color: #ce93d8;
-    margin-bottom: 10px;
-  }
-  .code-digits {
-    font-size: 52px;
-    font-weight: 900;
-    letter-spacing: 14px;
-    color: #8e24aa;
-    line-height: 1;
-  }
-  .code-hint {
-    font-size: 12px;
-    color: #ce93d8;
-    margin-top: 10px;
-  }
-
-  /* Code input */
-  .code-input {
+    border-radius: 18px;
+    padding: 20px 16px 16px;
+    margin-bottom: 18px;
     width: 100%;
-    padding: 16px 10px;
-    border: 2.5px solid #f8bbd0;
-    border-radius: 16px;
-    font-size: 40px;
-    font-weight: 800;
-    text-align: center;
-    letter-spacing: 14px;
-    color: #c2185b;
-    background: #fff9fc;
-    outline: none;
-    margin-bottom: 14px;
-    transition: border-color 0.2s;
   }
-  .code-input:focus { border-color: #ab47bc; }
-  .code-input::placeholder { color: #f8bbd0; letter-spacing: 8px; font-size: 32px; }
+  .code-label { font-size: 11px; text-transform: uppercase; letter-spacing:1.5px; color:#ce93d8; margin-bottom:8px; }
+  .code-digits { font-size:54px; font-weight:900; letter-spacing:16px; color:#7b1fa2; line-height:1; }
+  .code-hint { font-size:11px; color:#ce93d8; margin-top:8px; }
 
-  /* Sync status */
-  .sync-status {
-    font-size: 14px;
-    color: #e91e63;
-    font-weight: 500;
-    min-height: 22px;
-    margin-bottom: 12px;
+  /* Input */
+  .code-input {
+    width: 100%; padding: 14px 8px;
+    border: 2.5px solid #f8bbd0; border-radius: 14px;
+    font-size: 38px; font-weight: 800; text-align: center;
+    letter-spacing: 14px; color: #c2185b; background: #fff9fc;
+    outline: none; margin-bottom: 12px; transition: border-color .2s;
   }
+  .code-input:focus { border-color: #9c27b0; }
+  .code-input::placeholder { color:#f8bbd0; letter-spacing:8px; font-size:30px; }
 
-  /* Event log */
-  .events {
-    max-height: 72px;
-    overflow: hidden;
-    margin-bottom: 16px;
+  /* Status + events */
+  .status {
+    font-size: 14px; font-weight: 500; color: #e91e63;
+    min-height: 20px; margin-bottom: 10px; text-align: center;
   }
-  .ev {
-    font-size: 12px;
-    padding: 2px 0;
-    color: #ccc;
-    transition: color 0.3s;
-  }
-  .ev.sent  { color: #f06292; }
-  .ev.recv  { color: #ba68c8; }
-
-  /* Sections */
-  .screen { display: none; }
-  .screen.active { display: block; }
-
-  /* Pulse for waiting */
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.45} }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
   .pulse { animation: pulse 2s ease-in-out infinite; }
+
+  .events { width: 100%; max-height: 64px; overflow: hidden; margin-bottom: 14px; }
+  .ev { font-size: 12px; padding: 1px 0; color: #ddd; }
+  .ev.sent { color: #f06292; }
+  .ev.recv { color: #ba68c8; }
+
+  /* Screens */
+  .screen { display:none; width:100%; }
+  .screen.on { display:flex; flex-direction:column; align-items:center; width:100%; }
 </style>
 </head>
 <body>
-<div class="card">
-  <h1>togetherly</h1>
-  <p class="tagline">watch together, feel together</p>
 
-  <div class="vlc-pill" id="vlcPill">
-    <div class="dot"></div>
-    <span id="vlcText">checking VLC...</span>
-  </div>
+<h1>togetherly</h1>
+<p class="tagline">watch together, feel together</p>
 
-  <!-- Home -->
-  <div class="screen active" id="sHome">
-    <button class="btn btn-primary" id="btnCreate" onclick="createRoom()">Create room</button>
-    <button class="btn btn-primary" style="background:linear-gradient(135deg,#ba68c8,#7b1fa2);margin-top:2px" onclick="showJoin()">Join room</button>
-  </div>
+<div class="pill" id="pill"><div class="dot"></div><span id="pillTxt">checking VLC...</span></div>
 
-  <!-- Join -->
-  <div class="screen" id="sJoin">
-    <input class="code-input" id="codeInput" type="text" maxlength="4" placeholder="----" autocomplete="off">
-    <button class="btn btn-primary" style="background:linear-gradient(135deg,#ba68c8,#7b1fa2)" onclick="joinRoom()">Join &#9825;</button>
-    <button class="btn btn-ghost" onclick="show('sHome')">Back</button>
-  </div>
+<!-- Home -->
+<div class="screen on" id="sHome">
+  <button class="btn btn-pink"   onclick="createRoom()">Create room</button>
+  <button class="btn btn-purple" onclick="showJoin()">Join room</button>
+</div>
 
-  <!-- Room -->
-  <div class="screen" id="sRoom">
-    <div class="code-box" id="codeBox" style="display:none">
-      <div class="code-label">room code</div>
-      <div class="code-digits" id="codeDigits">----</div>
-      <div class="code-hint">share this with your partner</div>
-    </div>
-    <div class="sync-status pulse" id="syncStatus">Waiting for partner...</div>
-    <div class="events" id="events"></div>
-    <button class="btn btn-ghost" onclick="location.reload()">Leave room</button>
+<!-- Join -->
+<div class="screen" id="sJoin">
+  <input class="code-input" id="codeIn" type="text" maxlength="4" placeholder="----" autocomplete="off">
+  <button class="btn btn-purple" onclick="joinRoom()">Join &#9825;</button>
+  <button class="btn btn-ghost"  onclick="show('sHome')">Back</button>
+</div>
+
+<!-- Room -->
+<div class="screen" id="sRoom">
+  <div class="code-box" id="codeBox" style="display:none">
+    <div class="code-label">room code — share with your partner</div>
+    <div class="code-digits" id="codeDigits">----</div>
   </div>
+  <div class="status pulse" id="roomStatus">Waiting for partner...</div>
+  <div class="events" id="events"></div>
+  <button class="btn btn-ghost" onclick="window.go_quit()">Quit</button>
 </div>
 
 <script>
-const ws = new WebSocket('ws://' + location.host + '/ui');
-
-ws.onmessage = ({data}) => {
-  const m = JSON.parse(data);
-
-  if (m.type === 'vlc_status') {
-    const pill = document.getElementById('vlcPill');
-    const txt  = document.getElementById('vlcText');
-    if (m.connected) {
-      pill.className = 'vlc-pill ok';
-      txt.textContent = 'VLC connected';
-    } else {
-      pill.className = 'vlc-pill err';
-      txt.textContent = m.message || 'VLC not found';
-    }
-  }
-
-  if (m.type === 'room_created') {
-    document.getElementById('codeDigits').textContent = m.code;
-    document.getElementById('codeBox').style.display = 'block';
-    document.getElementById('syncStatus').textContent = 'Waiting for partner...';
-    document.getElementById('syncStatus').classList.add('pulse');
-    show('sRoom');
-  }
-
-  if (m.type === 'room_joined') {
-    document.getElementById('syncStatus').textContent = 'Connecting...';
-    show('sRoom');
-  }
-
-  if (m.type === 'partner_joined') {
-    document.getElementById('syncStatus').textContent = 'Partner connected ♥ Syncing...';
-    document.getElementById('syncStatus').classList.remove('pulse');
-  }
-
-  if (m.type === 'sync_event') {
-    document.getElementById('syncStatus').classList.remove('pulse');
-    document.getElementById('syncStatus').textContent =
-      m.direction === 'received' ? 'Partner ' + m.event + 'd ♥' : 'Synced ♥';
-
-    const div = document.createElement('div');
-    div.className = 'ev ' + (m.direction === 'sent' ? 'sent' : 'recv');
-    div.textContent = (m.direction === 'sent' ? '  you' : 'them') + '  ' + m.event + '  ' + m.time;
-    const log = document.getElementById('events');
-    log.prepend(div);
-    while (log.children.length > 4) log.lastChild.remove();
-  }
-
-  if (m.type === 'error') {
-    document.getElementById('syncStatus').textContent = m.message;
-    document.getElementById('syncStatus').classList.remove('pulse');
-  }
-};
-
 function show(id) {
-  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
-  document.getElementById(id).classList.add('active');
+  document.querySelectorAll('.screen').forEach(s => s.classList.replace('on','') || s.classList.remove('on'));
+  document.getElementById(id).classList.add('on');
 }
+function showJoin() { show('sJoin'); document.getElementById('codeIn').focus(); }
 
-function showJoin() {
-  show('sJoin');
-  document.getElementById('codeInput').focus();
-}
-
-function createRoom() { ws.send(JSON.stringify({type: 'create_room'})); }
-
+function createRoom() { window.go_createRoom(); }
 function joinRoom() {
-  const code = document.getElementById('codeInput').value;
-  if (code.length === 4) ws.send(JSON.stringify({type: 'join_room', code}));
+  const c = document.getElementById('codeIn').value;
+  if (c.length === 4) window.go_joinRoom(c);
 }
 
-// Sanitize input + auto-submit on 4 digits
-document.getElementById('codeInput').addEventListener('input', function() {
-  this.value = this.value.replace(/\D/g, '').slice(0, 4);
+document.getElementById('codeIn').addEventListener('input', function() {
+  this.value = this.value.replace(/\D/g,'').slice(0,4);
   if (this.value.length === 4) joinRoom();
 });
+
+// Called from Go
+function vlcStatus(ok, msg) {
+  const p = document.getElementById('pill');
+  p.className = 'pill ' + (ok ? 'ok' : 'err');
+  document.getElementById('pillTxt').textContent = msg;
+}
+function roomCreated(code) {
+  document.getElementById('codeDigits').textContent = code;
+  document.getElementById('codeBox').style.display = 'block';
+  setStatus('Waiting for partner...', true);
+  show('sRoom');
+}
+function roomJoined(code) {
+  setStatus('Connecting...', false);
+  show('sRoom');
+}
+function partnerJoined() { setStatus('Partner connected ♥ Syncing...', false); }
+function syncEvent(dir, event, time) {
+  setStatus(dir==='recv' ? 'Partner '+event+'d ♥' : 'Synced ♥', false);
+  const d = document.createElement('div');
+  d.className = 'ev ' + dir;
+  d.textContent = (dir==='sent' ? '  you' : 'them') + '  ' + event + '  ' + time;
+  const log = document.getElementById('events');
+  log.prepend(d);
+  while (log.children.length > 4) log.lastChild.remove();
+}
+function showError(msg) { setStatus(msg, false); }
+
+function setStatus(msg, pulse) {
+  const el = document.getElementById('roomStatus');
+  el.textContent = msg;
+  el.className = 'status' + (pulse ? ' pulse' : '');
+}
 </script>
 </body>
 </html>`
