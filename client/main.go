@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,8 +18,8 @@ import (
 	"time"
 	"unsafe"
 
-	webview "github.com/jchv/go-webview2"
 	"github.com/gorilla/websocket"
+	webview "github.com/jchv/go-webview2"
 	"golang.org/x/sys/windows"
 )
 
@@ -30,36 +31,35 @@ const (
 	serverURL     = "wss://togetherly-eqpo.onrender.com/ws"
 
 	// Win32
-	wmClose      = 0x0010
-	wmTrayIcon   = 0x8001 // WM_APP + 1
-	wmLButtonUp  = 0x0202
-	gwlpWndProc  = ^uintptr(3) // -4
-	swHide       = 0
-	swRestore    = 9
-	nimAdd       = 0
-	nimDelete    = 2
-	nifMessage   = 1
-	nifIcon      = 2
-	nifTip       = 4
-	idiApp       = uintptr(32512)
+	wmClose         = 0x0010
+	wmTrayIcon      = 0x8001
+	wmLButtonUp     = 0x0202
+	gwlpWndProc     = ^uintptr(3)
+	swHide          = 0
+	swRestore       = 9
+	nimAdd          = 0
+	nimDelete       = 2
+	nifMessage      = 1
+	nifIcon         = 2
+	nifTip          = 4
+	idiApp          = uintptr(32512)
 )
 
-// ── Win32 lazy procs ──────────────────────────────────────────────────────────
+// ── Win32 ─────────────────────────────────────────────────────────────────────
 
 var (
-	user32   = windows.NewLazySystemDLL("user32.dll")
-	shell32  = windows.NewLazySystemDLL("shell32.dll")
+	user32  = windows.NewLazySystemDLL("user32.dll")
+	shell32 = windows.NewLazySystemDLL("shell32.dll")
 
-	setWinLong   = user32.NewProc("SetWindowLongPtrW")
-	getWinLong   = user32.NewProc("GetWindowLongPtrW")
-	callWinProc  = user32.NewProc("CallWindowProcW")
-	showWin      = user32.NewProc("ShowWindow")
+	setWinLong    = user32.NewProc("SetWindowLongPtrW")
+	getWinLong    = user32.NewProc("GetWindowLongPtrW")
+	callWinProc   = user32.NewProc("CallWindowProcW")
+	showWin       = user32.NewProc("ShowWindow")
 	setForeground = user32.NewProc("SetForegroundWindow")
-	loadIcon     = user32.NewProc("LoadIconW")
-	shellNotify  = shell32.NewProc("Shell_NotifyIconW")
+	loadIcon      = user32.NewProc("LoadIconW")
+	shellNotify   = shell32.NewProc("Shell_NotifyIconW")
 )
 
-// notifyIconData maps to NOTIFYICONDATAW
 type notifyIconData struct {
 	CbSize           uint32
 	HWnd             uintptr
@@ -74,10 +74,10 @@ type notifyIconData struct {
 	UVersion         uint32
 	SzInfoTitle      [64]uint16
 	DwInfoFlags      uint32
-	_                [4]byte // GUID padding
+	_                [4]byte
 }
 
-// ── Global state ──────────────────────────────────────────────────────────────
+// ── State ─────────────────────────────────────────────────────────────────────
 
 var (
 	gView       webview.WebView
@@ -87,8 +87,6 @@ var (
 	ignoreMu    sync.Mutex
 	ignoreUntil time.Time
 )
-
-// ── UI helpers ────────────────────────────────────────────────────────────────
 
 func evalUI(js string) {
 	if gView != nil {
@@ -100,8 +98,6 @@ func jsStr(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
 }
-
-// ── Loop prevention ───────────────────────────────────────────────────────────
 
 func isIgnoring() bool {
 	ignoreMu.Lock()
@@ -169,8 +165,6 @@ func applyEvent(e syncEvent) {
 	evalUI(fmt.Sprintf("syncEvent('recv',%s,%s)", jsStr(e.Type), jsStr(fmtTime(e.Time))))
 }
 
-// ── VLC auto-setup ────────────────────────────────────────────────────────────
-
 func autoConfigureVLC() error {
 	path := filepath.Join(os.Getenv("APPDATA"), "vlc", "vlcrc")
 	data, err := os.ReadFile(path)
@@ -218,12 +212,12 @@ func watchVLC() {
 			autoConfigureVLC()
 			configured = true
 		}
-		evalUI("vlcStatus(false, 'Waiting for VLC — please open VLC')")
+		evalUI("vlcStatus(false, 'Waiting for VLC')")
 		time.Sleep(2 * time.Second)
 	}
 }
 
-// ── Sync loop ─────────────────────────────────────────────────────────────────
+// ── Sync ──────────────────────────────────────────────────────────────────────
 
 func connectAndSync(code string, isHost bool) {
 	if isHost {
@@ -234,7 +228,7 @@ func connectAndSync(code string, isHost bool) {
 
 	conn, _, err := websocket.DefaultDialer.Dial(serverURL, nil)
 	if err != nil {
-		evalUI(fmt.Sprintf("showError(%s)", jsStr("Cannot reach server — check internet")))
+		evalUI(fmt.Sprintf("showError(%s)", jsStr("Cannot reach server")))
 		return
 	}
 
@@ -245,7 +239,7 @@ func connectAndSync(code string, isHost bool) {
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
-				evalUI("showError('Disconnected from server')")
+				evalUI("showError('Disconnected')")
 				return
 			}
 			var raw map[string]interface{}
@@ -314,7 +308,7 @@ func connectAndSync(code string, isHost bool) {
 	}
 }
 
-// ── Tray icon ─────────────────────────────────────────────────────────────────
+// ── Tray + window subclass ───────────────────────────────────────────────────
 
 func addTrayIcon(hwnd uintptr) {
 	icon, _, _ := loadIcon.Call(0, idiApp)
@@ -338,12 +332,9 @@ func removeTrayIcon(hwnd uintptr) {
 	shellNotify.Call(nimDelete, uintptr(unsafe.Pointer(&nid)))
 }
 
-// ── Window subclass ───────────────────────────────────────────────────────────
-
 func wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 	switch msg {
 	case wmClose:
-		// Hide to tray instead of closing
 		showWin.Call(hwnd, swHide)
 		return 0
 	case wmTrayIcon:
@@ -370,6 +361,21 @@ func hookWindow(hwnd uintptr) {
 func main() {
 	runtime.LockOSThread()
 
+	// Local HTTP server serving the UI (more reliable than SetHtml)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	uiURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(htmlUI))
+	})
+	go http.Serve(listener, mux)
+
 	w := webview.New(false)
 	defer func() {
 		removeTrayIcon(gHWND)
@@ -378,9 +384,9 @@ func main() {
 	gView = w
 
 	w.SetTitle("togetherly")
-	w.SetSize(380, 520, webview.HintFixed)
-	w.SetHtml(htmlUI)
+	w.SetSize(400, 620, webview.HintFixed)
 
+	// Register bindings BEFORE navigation so they're available on first load
 	w.Bind("go_createRoom", func() {
 		code := fmt.Sprintf("%04d", rand.Intn(10000))
 		go connectAndSync(code, true)
@@ -393,7 +399,8 @@ func main() {
 		w.Terminate()
 	})
 
-	// Hook window after first event loop tick (window is created by then)
+	w.Navigate(uiURL)
+
 	w.Dispatch(func() {
 		gHWND = uintptr(w.Window())
 		hookWindow(gHWND)
@@ -415,174 +422,314 @@ const htmlUI = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<title>togetherly</title>
 <style>
-  * { margin:0; padding:0; box-sizing:border-box; }
-  html, body { height:100%; }
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { height:100%; overflow:hidden; }
+
+  :root {
+    --pink:        #ec4899;
+    --pink-dark:   #be185d;
+    --purple:      #a855f7;
+    --purple-dark: #7e22ce;
+    --bg-1:        #fff5f9;
+    --bg-2:        #fdf2f8;
+    --bg-3:        #fce8f3;
+    --text:        #4a1942;
+    --text-soft:   #b29db0;
+    --shadow-pink:   0 8px 24px rgba(190, 24, 93, 0.18);
+    --shadow-purple: 0 8px 24px rgba(126, 34, 206, 0.18);
+  }
 
   body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    background: #fdf2f8;
+    font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+    background: radial-gradient(ellipse at 50% 0%, var(--bg-1) 0%, var(--bg-2) 50%, var(--bg-3) 100%);
+    color: var(--text);
     display: flex;
     flex-direction: column;
     align-items: center;
-    justify-content: center;
-    padding: 32px 28px;
-    gap: 0;
+    padding: 28px 32px 24px;
     user-select: none;
     -webkit-user-select: none;
   }
 
+  /* Logo */
+  .logo {
+    width: 56px;
+    height: 56px;
+    margin-bottom: 10px;
+    filter: drop-shadow(0 6px 14px rgba(190, 24, 93, 0.22));
+    animation: float 3.4s ease-in-out infinite;
+  }
+  @keyframes float {
+    0%, 100% { transform: translateY(0) rotate(0deg); }
+    50%      { transform: translateY(-5px) rotate(-2deg); }
+  }
+
   h1 {
     font-size: 34px;
-    font-weight: 900;
-    background: linear-gradient(135deg, #e91e63, #9c27b0);
+    font-weight: 800;
+    background: linear-gradient(135deg, var(--pink) 0%, var(--purple-dark) 100%);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;
-    letter-spacing: -1.5px;
-    margin-bottom: 4px;
+    letter-spacing: -1.2px;
+    line-height: 1;
   }
 
   .tagline {
-    font-size: 12px;
-    color: #ccc;
-    margin-bottom: 24px;
-    letter-spacing: 0.3px;
+    font-size: 11px;
+    color: var(--text-soft);
+    margin-top: 8px;
+    letter-spacing: 0.6px;
+    margin-bottom: 22px;
+    font-weight: 500;
   }
 
-  /* VLC pill */
+  /* Status pill */
   .pill {
     display: inline-flex;
     align-items: center;
-    gap: 7px;
-    padding: 6px 14px;
-    border-radius: 20px;
-    background: #f0f0f0;
-    font-size: 12px;
+    gap: 8px;
+    padding: 7px 14px;
+    border-radius: 100px;
+    background: rgba(255, 255, 255, 0.7);
+    border: 1px solid rgba(0, 0, 0, 0.04);
+    font-size: 11px;
+    font-weight: 600;
     color: #999;
-    margin-bottom: 28px;
+    margin-bottom: 30px;
     transition: all 0.3s;
+    letter-spacing: 0.2px;
   }
-  .pill.ok  { background: #e8f5e9; color: #2e7d32; }
-  .pill.err { background: #fce4ec; color: #b71c1c; }
-  .dot {
-    width: 7px; height: 7px; border-radius: 50%; background: #ccc; flex-shrink: 0;
-  }
-  .ok  .dot { background: #43a047; }
-  .err .dot { background: #e53935; animation: blink 1.2s infinite; }
-  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.25} }
+  .pill.ok  { background: rgba(34,197,94,0.12);  color: #15803d; border-color: rgba(34,197,94,0.18); }
+  .pill.err { background: rgba(239,68,68,0.12);  color: #b91c1c; border-color: rgba(239,68,68,0.18); }
+
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: #ccc; }
+  .ok .dot  { background: #22c55e; box-shadow: 0 0 8px rgba(34,197,94,0.5); }
+  .err .dot { background: #ef4444; animation: pulse 1.4s infinite; }
 
   /* Buttons */
   .btn {
-    width: 100%; padding: 14px; border-radius: 14px; border: none;
-    font-size: 15px; font-weight: 600; cursor: pointer; transition: all .15s;
-    margin-bottom: 10px;
-  }
-  .btn:last-child { margin-bottom: 0; }
-  .btn-pink {
-    background: linear-gradient(135deg, #f06292, #c2185b);
-    color: #fff;
-    box-shadow: 0 4px 14px rgba(194,24,91,.22);
-  }
-  .btn-purple {
-    background: linear-gradient(135deg, #ce93d8, #7b1fa2);
-    color: #fff;
-    box-shadow: 0 4px 14px rgba(123,31,162,.2);
-  }
-  .btn-pink:hover   { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(194,24,91,.32); }
-  .btn-purple:hover { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(123,31,162,.28); }
-  .btn-ghost {
-    background: none; color: #bbb; font-size: 13px; padding: 8px;
-  }
-  .btn-ghost:hover { color: #999; }
-
-  /* Code box */
-  .code-box {
-    background: linear-gradient(135deg, #fce4ec, #f3e5f5);
-    border-radius: 18px;
-    padding: 20px 16px 16px;
-    margin-bottom: 18px;
     width: 100%;
+    padding: 16px 18px;
+    border-radius: 16px;
+    border: none;
+    font-size: 15px;
+    font-weight: 600;
+    font-family: inherit;
+    cursor: pointer;
+    transition: all 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+    margin-bottom: 11px;
+    color: white;
+    position: relative;
+    overflow: hidden;
+    letter-spacing: 0.2px;
   }
-  .code-label { font-size: 11px; text-transform: uppercase; letter-spacing:1.5px; color:#ce93d8; margin-bottom:8px; }
-  .code-digits { font-size:54px; font-weight:900; letter-spacing:16px; color:#7b1fa2; line-height:1; }
-  .code-hint { font-size:11px; color:#ce93d8; margin-top:8px; }
+  .btn:focus { outline: none; }
+  .btn:active { transform: scale(0.98); }
+
+  .btn-pink {
+    background: linear-gradient(135deg, #f472b6 0%, #be185d 100%);
+    box-shadow: var(--shadow-pink);
+  }
+  .btn-pink:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 12px 28px rgba(190, 24, 93, 0.28);
+  }
+
+  .btn-purple {
+    background: linear-gradient(135deg, #c084fc 0%, #7e22ce 100%);
+    box-shadow: var(--shadow-purple);
+  }
+  .btn-purple:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 12px 28px rgba(126, 34, 206, 0.28);
+  }
+
+  .btn-ghost {
+    background: none;
+    color: var(--text-soft);
+    font-size: 12px;
+    font-weight: 500;
+    padding: 10px;
+    margin-top: 4px;
+    box-shadow: none;
+  }
+  .btn-ghost:hover { color: #888; }
+
+  /* Code card */
+  .code-card {
+    background: linear-gradient(135deg, #ffffff 0%, #fdf4f9 100%);
+    border: 1px solid rgba(190, 24, 93, 0.08);
+    border-radius: 20px;
+    padding: 20px 18px 18px;
+    margin-bottom: 16px;
+    width: 100%;
+    text-align: center;
+    box-shadow: 0 4px 20px rgba(190, 24, 93, 0.06);
+  }
+  .code-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1.6px;
+    color: var(--purple);
+    margin-bottom: 12px;
+    font-weight: 700;
+  }
+  .code-digits {
+    font-size: 54px;
+    font-weight: 900;
+    letter-spacing: 14px;
+    background: linear-gradient(135deg, var(--pink-dark), var(--purple-dark));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    line-height: 1;
+    padding-left: 14px; /* compensate letter-spacing */
+  }
+  .code-hint {
+    font-size: 11px;
+    color: var(--text-soft);
+    margin-top: 10px;
+    font-weight: 500;
+  }
 
   /* Input */
   .code-input {
-    width: 100%; padding: 14px 8px;
-    border: 2.5px solid #f8bbd0; border-radius: 14px;
-    font-size: 38px; font-weight: 800; text-align: center;
-    letter-spacing: 14px; color: #c2185b; background: #fff9fc;
-    outline: none; margin-bottom: 12px; transition: border-color .2s;
+    width: 100%;
+    padding: 16px 8px;
+    border: 2px solid rgba(190, 24, 93, 0.15);
+    border-radius: 16px;
+    font-size: 36px;
+    font-weight: 800;
+    text-align: center;
+    letter-spacing: 14px;
+    color: var(--pink-dark);
+    background: white;
+    outline: none;
+    margin-bottom: 12px;
+    font-family: inherit;
+    transition: all 0.2s;
+    padding-left: 22px;
   }
-  .code-input:focus { border-color: #9c27b0; }
-  .code-input::placeholder { color:#f8bbd0; letter-spacing:8px; font-size:30px; }
-
-  /* Status + events */
-  .status {
-    font-size: 14px; font-weight: 500; color: #e91e63;
-    min-height: 20px; margin-bottom: 10px; text-align: center;
+  .code-input:focus {
+    border-color: var(--purple);
+    box-shadow: 0 0 0 4px rgba(168, 85, 247, 0.12);
   }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
-  .pulse { animation: pulse 2s ease-in-out infinite; }
+  .code-input::placeholder {
+    color: rgba(248, 187, 208, 0.6);
+    letter-spacing: 8px;
+    font-size: 30px;
+  }
 
-  .events { width: 100%; max-height: 64px; overflow: hidden; margin-bottom: 14px; }
-  .ev { font-size: 12px; padding: 1px 0; color: #ddd; }
-  .ev.sent { color: #f06292; }
-  .ev.recv { color: #ba68c8; }
+  /* Status text */
+  .status-text {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--pink-dark);
+    text-align: center;
+    margin: 4px 0 14px;
+    min-height: 18px;
+    letter-spacing: 0.2px;
+  }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.45} }
+  .pulse { animation: pulse 2s infinite; }
+
+  /* Events */
+  .events {
+    width: 100%;
+    max-height: 60px;
+    overflow: hidden;
+    margin-bottom: 14px;
+    text-align: center;
+  }
+  .ev {
+    font-size: 11px;
+    color: #d4c5d0;
+    padding: 1px 0;
+    font-weight: 500;
+    letter-spacing: 0.3px;
+  }
+  .ev.sent { color: var(--pink); }
+  .ev.recv { color: var(--purple); }
 
   /* Screens */
-  .screen { display:none; width:100%; }
-  .screen.on { display:flex; flex-direction:column; align-items:center; width:100%; }
+  .screen { display: none; width: 100%; }
+  .screen.on { display: flex; flex-direction: column; align-items: center; }
 </style>
 </head>
 <body>
 
+<svg class="logo" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="heartGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#ec4899"/>
+      <stop offset="50%"  stop-color="#d946ef"/>
+      <stop offset="100%" stop-color="#a855f7"/>
+    </linearGradient>
+    <linearGradient id="playGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%"   stop-color="#ffffff" stop-opacity="1"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.85"/>
+    </linearGradient>
+  </defs>
+  <path d="M50,86 C22,64 8,42 22,26 C32,15 46,20 50,32 C54,20 68,15 78,26 C92,42 78,64 50,86 Z"
+        fill="url(#heartGrad)"/>
+  <path d="M42,40 L42,62 L62,51 Z" fill="url(#playGrad)"/>
+</svg>
+
 <h1>togetherly</h1>
 <p class="tagline">watch together, feel together</p>
 
-<div class="pill" id="pill"><div class="dot"></div><span id="pillTxt">checking VLC...</span></div>
+<div class="pill" id="pill">
+  <div class="dot"></div>
+  <span id="pillTxt">checking VLC...</span>
+</div>
 
-<!-- Home -->
 <div class="screen on" id="sHome">
   <button class="btn btn-pink"   onclick="createRoom()">Create room</button>
   <button class="btn btn-purple" onclick="showJoin()">Join room</button>
 </div>
 
-<!-- Join -->
 <div class="screen" id="sJoin">
-  <input class="code-input" id="codeIn" type="text" maxlength="4" placeholder="----" autocomplete="off">
+  <input class="code-input" id="codeIn" type="text" maxlength="4" placeholder="----" autocomplete="off" inputmode="numeric">
   <button class="btn btn-purple" onclick="joinRoom()">Join &#9825;</button>
   <button class="btn btn-ghost"  onclick="show('sHome')">Back</button>
 </div>
 
-<!-- Room -->
 <div class="screen" id="sRoom">
-  <div class="code-box" id="codeBox" style="display:none">
-    <div class="code-label">room code — share with your partner</div>
+  <div class="code-card" id="codeBox" style="display:none">
+    <div class="code-label">your room code</div>
     <div class="code-digits" id="codeDigits">----</div>
+    <div class="code-hint">share with your partner</div>
   </div>
-  <div class="status pulse" id="roomStatus">Waiting for partner...</div>
+  <div class="status-text pulse" id="roomStatus">Waiting for partner...</div>
   <div class="events" id="events"></div>
-  <button class="btn btn-ghost" onclick="window.go_quit()">Quit</button>
+  <button class="btn btn-ghost" onclick="window.go_quit && window.go_quit()">Quit</button>
 </div>
 
 <script>
 function show(id) {
-  document.querySelectorAll('.screen').forEach(s => s.classList.replace('on','') || s.classList.remove('on'));
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('on'));
   document.getElementById(id).classList.add('on');
 }
 function showJoin() { show('sJoin'); document.getElementById('codeIn').focus(); }
 
-function createRoom() { window.go_createRoom(); }
+function createRoom() {
+  if (window.go_createRoom) {
+    window.go_createRoom();
+  }
+}
+
 function joinRoom() {
   const c = document.getElementById('codeIn').value;
-  if (c.length === 4) window.go_joinRoom(c);
+  if (c.length === 4 && window.go_joinRoom) {
+    window.go_joinRoom(c);
+  }
 }
 
 document.getElementById('codeIn').addEventListener('input', function() {
-  this.value = this.value.replace(/\D/g,'').slice(0,4);
+  this.value = this.value.replace(/\D/g, '').slice(0, 4);
   if (this.value.length === 4) joinRoom();
 });
 
@@ -599,15 +746,16 @@ function roomCreated(code) {
   show('sRoom');
 }
 function roomJoined(code) {
-  setStatus('Connecting...', false);
+  setStatus('Connecting...', true);
   show('sRoom');
 }
 function partnerJoined() { setStatus('Partner connected ♥ Syncing...', false); }
+
 function syncEvent(dir, event, time) {
-  setStatus(dir==='recv' ? 'Partner '+event+'d ♥' : 'Synced ♥', false);
+  setStatus(dir === 'recv' ? 'Partner ' + event + 'd ♥' : 'Synced ♥', false);
   const d = document.createElement('div');
   d.className = 'ev ' + dir;
-  d.textContent = (dir==='sent' ? '  you' : 'them') + '  ' + event + '  ' + time;
+  d.textContent = (dir === 'sent' ? '↗ you' : '↙ them') + '  ' + event + '  ' + time;
   const log = document.getElementById('events');
   log.prepend(d);
   while (log.children.length > 4) log.lastChild.remove();
@@ -617,7 +765,7 @@ function showError(msg) { setStatus(msg, false); }
 function setStatus(msg, pulse) {
   const el = document.getElementById('roomStatus');
   el.textContent = msg;
-  el.className = 'status' + (pulse ? ' pulse' : '');
+  el.className = 'status-text' + (pulse ? ' pulse' : '');
 }
 </script>
 </body>
