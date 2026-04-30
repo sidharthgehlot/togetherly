@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -374,11 +375,59 @@ func makeHeartIcon() (string, error) {
 	binary.Write(&ico, binary.LittleEndian, uint32(22))              // offset
 	ico.Write(pngData)
 
-	icoPath := filepath.Join(os.TempDir(), "togetherly.ico")
+	icoPath := filepath.Join(appDataDir(), "togetherly.ico")
 	if err := os.WriteFile(icoPath, ico.Bytes(), 0644); err != nil {
 		return "", err
 	}
 	return icoPath, nil
+}
+
+// appDataDir returns %LOCALAPPDATA%\togetherly, creating it if needed.
+func appDataDir() string {
+	dir := filepath.Join(os.Getenv("LOCALAPPDATA"), "togetherly")
+	os.MkdirAll(dir, 0755)
+	return dir
+}
+
+// psEscape escapes a string for safe insertion inside a PowerShell single-quoted literal.
+func psEscape(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
+// ensureDesktopShortcut creates a togetherly.lnk on the user's desktop on first run.
+// Idempotent — uses a marker file in AppData so it only runs once.
+func ensureDesktopShortcut(icoPath string) {
+	marker := filepath.Join(appDataDir(), ".shortcut-created")
+	if _, err := os.Stat(marker); err == nil {
+		return
+	}
+
+	exePath, err := os.Executable()
+	if err != nil {
+		return
+	}
+
+	script := fmt.Sprintf(`
+$desktop = [Environment]::GetFolderPath('Desktop')
+$path = Join-Path $desktop 'togetherly.lnk'
+$sh = New-Object -ComObject WScript.Shell
+$s = $sh.CreateShortcut($path)
+$s.TargetPath = '%s'
+$s.IconLocation = '%s,0'
+$s.WorkingDirectory = '%s'
+$s.Description = 'togetherly — watch together, feel together'
+$s.Save()
+`, psEscape(exePath), psEscape(icoPath), psEscape(filepath.Dir(exePath)))
+
+	cmd := exec.Command("powershell",
+		"-NoProfile", "-NonInteractive",
+		"-ExecutionPolicy", "Bypass",
+		"-WindowStyle", "Hidden",
+		"-Command", script)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+	if err := cmd.Run(); err == nil {
+		os.WriteFile(marker, []byte("1"), 0644)
+	}
 }
 
 // loadIconFromFile loads an .ico file and returns its HICON.
@@ -459,9 +508,10 @@ func hookWindow(hwnd uintptr) {
 func main() {
 	runtime.LockOSThread()
 
-	// Generate the heart icon and load it as an HICON
+	// Generate the heart icon, load it as an HICON, drop a desktop shortcut on first run
 	if icoPath, err := makeHeartIcon(); err == nil {
 		gAppIcon = loadIconFromFile(icoPath)
+		go ensureDesktopShortcut(icoPath)
 	}
 
 	// Local HTTP server serving the UI (more reliable than SetHtml)
