@@ -537,7 +537,7 @@ func main() {
 	gView = w
 
 	w.SetTitle("togetherly")
-	w.SetSize(400, 620, webview.HintFixed)
+	w.SetSize(400, 440, webview.HintFixed) // initial size — JS resizes to fit on load
 
 	// Register bindings BEFORE navigation so they're available on first load
 	w.Bind("go_createRoom", func() {
@@ -550,6 +550,15 @@ func main() {
 	w.Bind("go_quit", func() {
 		removeTrayIcon(gHWND)
 		w.Terminate()
+	})
+	// JS reports the actual content height so we resize to fit each screen
+	w.Bind("go_resize", func(h int) {
+		w.Dispatch(func() {
+			if h < 360 {
+				h = 360
+			}
+			w.SetSize(400, h+40, webview.HintFixed) // +40 ≈ title bar + borders on Win11
+		})
 	})
 
 	w.Navigate(uiURL)
@@ -858,9 +867,19 @@ const htmlUI = `<!DOCTYPE html>
 </div>
 
 <script>
+function autoResize() {
+  // Two RAFs: layout settles after the first, measure on the second
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    const h = Math.ceil(document.body.getBoundingClientRect().height);
+    if (window.go_resize) window.go_resize(h);
+  }));
+}
+window.addEventListener('load', autoResize);
+
 function show(id) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('on'));
   document.getElementById(id).classList.add('on');
+  autoResize();
 }
 function showJoin() { show('sJoin'); document.getElementById('codeIn').focus(); }
 
