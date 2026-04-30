@@ -25,7 +25,7 @@ const (
 	seekThreshold = 3.0
 
 	// Replace this after deploying to Render
-	serverURL = "wss://togetherly.onrender.com/ws"
+	serverURL = "wss://togetherly-eqpo.onrender.com/ws"
 )
 
 // ── VLC types ────────────────────────────────────────────────────────────────
