@@ -1,14 +1,15 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -20,27 +21,29 @@ import (
 
 const (
 	vlcBase       = "http://localhost:8080/requests/status.json"
-	vlcPass       = "togetherly" // auto-written into vlcrc on first run
+	vlcPass       = "togetherly"
 	pollInterval  = 500 * time.Millisecond
 	seekThreshold = 3.0
-
-	// Replace this after deploying to Render
-	serverURL = "wss://togetherly-eqpo.onrender.com/ws"
+	serverURL     = "wss://togetherly-eqpo.onrender.com/ws"
 )
 
-// ── VLC types ────────────────────────────────────────────────────────────────
+// ── UI connection ─────────────────────────────────────────────────────────────
 
-type vlcStatus struct {
-	Time  int    `json:"time"`
-	State string `json:"state"` // "playing", "paused", "stopped"
+var (
+	uiMu   sync.Mutex
+	uiConn *websocket.Conn
+)
+
+func sendUI(msg map[string]interface{}) {
+	uiMu.Lock()
+	defer uiMu.Unlock()
+	if uiConn != nil {
+		data, _ := json.Marshal(msg)
+		uiConn.WriteMessage(websocket.TextMessage, data)
+	}
 }
 
-type syncEvent struct {
-	Type string  `json:"type"` // "play", "pause", "seek"
-	Time float64 `json:"time"`
-}
-
-// ── Loop-prevention ──────────────────────────────────────────────────────────
+// ── Loop prevention ───────────────────────────────────────────────────────────
 
 var (
 	ignoreMu    sync.Mutex
@@ -59,12 +62,23 @@ func setIgnore() {
 	ignoreUntil = time.Now().Add(1500 * time.Millisecond)
 }
 
-// ── VLC HTTP API ─────────────────────────────────────────────────────────────
+// ── VLC ───────────────────────────────────────────────────────────────────────
 
-func getStatus() (*vlcStatus, error) {
+type vlcStatus struct {
+	Time  int    `json:"time"`
+	State string `json:"state"`
+}
+
+type syncEvent struct {
+	Type string  `json:"type"`
+	Time float64 `json:"time"`
+}
+
+func getVLCStatus() (*vlcStatus, error) {
+	client := &http.Client{Timeout: 1 * time.Second}
 	req, _ := http.NewRequest("GET", vlcBase, nil)
 	req.SetBasicAuth("", vlcPass)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -74,62 +88,56 @@ func getStatus() (*vlcStatus, error) {
 	return &s, json.Unmarshal(body, &s)
 }
 
-func sendCommand(cmd string) {
+func vlcCommand(cmd string) {
+	client := &http.Client{Timeout: 1 * time.Second}
 	req, _ := http.NewRequest("GET", vlcBase+"?"+cmd, nil)
 	req.SetBasicAuth("", vlcPass)
-	http.DefaultClient.Do(req)
+	client.Do(req)
 }
 
 func applyEvent(e syncEvent) {
 	setIgnore()
 	switch e.Type {
 	case "seek":
-		sendCommand(fmt.Sprintf("command=seek&val=%d", int(e.Time)))
+		vlcCommand(fmt.Sprintf("command=seek&val=%d", int(e.Time)))
 	case "pause":
-		sendCommand(fmt.Sprintf("command=seek&val=%d", int(e.Time)))
+		vlcCommand(fmt.Sprintf("command=seek&val=%d", int(e.Time)))
 		time.Sleep(80 * time.Millisecond)
-		if s, err := getStatus(); err == nil && s.State == "playing" {
-			sendCommand("command=pl_pause")
+		if s, err := getVLCStatus(); err == nil && s.State == "playing" {
+			vlcCommand("command=pl_pause")
 		}
 	case "play":
-		sendCommand(fmt.Sprintf("command=seek&val=%d", int(e.Time)))
+		vlcCommand(fmt.Sprintf("command=seek&val=%d", int(e.Time)))
 		time.Sleep(80 * time.Millisecond)
-		if s, err := getStatus(); err == nil && s.State != "playing" {
-			sendCommand("command=pl_pause")
+		if s, err := getVLCStatus(); err == nil && s.State != "playing" {
+			vlcCommand("command=pl_pause")
 		}
 	}
+	sendUI(map[string]interface{}{
+		"type": "sync_event", "direction": "received",
+		"event": e.Type, "time": fmtTime(e.Time),
+	})
 }
 
-// ── VLC auto-setup ───────────────────────────────────────────────────────────
-
-func vlcrcPath() string {
-	return filepath.Join(os.Getenv("APPDATA"), "vlc", "vlcrc")
-}
+// ── VLC auto-setup ────────────────────────────────────────────────────────────
 
 func autoConfigureVLC() error {
-	path := vlcrcPath()
-
+	path := filepath.Join(os.Getenv("APPDATA"), "vlc", "vlcrc")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// VLC not yet opened once — create a minimal config
-			if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-				return err
-			}
+			os.MkdirAll(filepath.Dir(path), 0755)
 			return os.WriteFile(path, []byte("extraintf=http\nhttp-password=togetherly\n"), 0644)
 		}
 		return err
 	}
-
 	content := string(data)
-
-	// Enable HTTP interface (may already have other interfaces like "rc")
 	extraRe := regexp.MustCompile(`(?m)^extraintf=(.*)$`)
 	if extraRe.MatchString(content) {
 		content = extraRe.ReplaceAllStringFunc(content, func(match string) string {
 			val := strings.TrimPrefix(match, "extraintf=")
 			if strings.Contains(val, "http") {
-				return match // already enabled
+				return match
 			}
 			if val == "" {
 				return "extraintf=http"
@@ -139,131 +147,73 @@ func autoConfigureVLC() error {
 	} else {
 		content += "\nextraintf=http\n"
 	}
-
-	// Set password to "togetherly"
 	passRe := regexp.MustCompile(`(?m)^http-password=.*$`)
 	if passRe.MatchString(content) {
 		content = passRe.ReplaceAllString(content, "http-password=togetherly")
 	} else {
 		content += "http-password=togetherly\n"
 	}
-
 	return os.WriteFile(path, []byte(content), 0644)
 }
 
-// ensureVLC checks if VLC HTTP API is reachable. If not, auto-configures and
-// asks the user to restart VLC.
-func ensureVLC(reader *bufio.Reader) bool {
-	if _, err := getStatus(); err == nil {
-		return true
+// watchVLC continuously checks VLC and updates the UI dot
+func watchVLC() {
+	configured := false
+	for {
+		if _, err := getVLCStatus(); err == nil {
+			sendUI(map[string]interface{}{"type": "vlc_status", "connected": true})
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		if !configured {
+			autoConfigureVLC()
+			configured = true
+			sendUI(map[string]interface{}{
+				"type": "vlc_status", "connected": false,
+				"message": "VLC ready — please restart VLC, then it'll connect automatically",
+			})
+		} else {
+			sendUI(map[string]interface{}{
+				"type": "vlc_status", "connected": false,
+				"message": "Waiting for VLC...",
+			})
+		}
+		time.Sleep(2 * time.Second)
 	}
-
-	fmt.Println("Setting up VLC sync interface automatically...")
-	if err := autoConfigureVLC(); err != nil {
-		fmt.Println("Could not auto-configure VLC:", err)
-		fmt.Println("Please enable it manually: Tools > Preferences > All > Interface > Main interfaces > Web")
-		fmt.Println("Set the password to: togetherly")
-		return false
-	}
-
-	fmt.Println("Done! Please restart VLC, then press Enter...")
-	reader.ReadString('\n')
-
-	// Give VLC a moment to start
-	time.Sleep(500 * time.Millisecond)
-
-	if _, err := getStatus(); err != nil {
-		fmt.Println("Still can't reach VLC. Make sure VLC is open and try again.")
-		return false
-	}
-
-	fmt.Println("VLC connected!")
-	return true
 }
 
-// ── Room code ────────────────────────────────────────────────────────────────
+// ── Sync loop ─────────────────────────────────────────────────────────────────
 
-func generateCode() string {
-	return fmt.Sprintf("%04d", rand.Intn(10000))
-}
-
-// ── Main ─────────────────────────────────────────────────────────────────────
-
-func main() {
-	reader := bufio.NewReader(os.Stdin)
-
-	fmt.Println("togetherly")
-	fmt.Println("----------")
-	fmt.Println()
-
-	if !ensureVLC(reader) {
-		fmt.Print("\nPress Enter to exit.")
-		reader.ReadString('\n')
-		return
-	}
-
-	fmt.Println("[1] Create room  (generates a code for your partner)")
-	fmt.Println("[2] Join room    (enter your partner's code)")
-	fmt.Print("\n> ")
-	choice, _ := reader.ReadString('\n')
-	choice = strings.TrimSpace(choice)
-
-	var roomCode string
-	switch choice {
-	case "1":
-		roomCode = generateCode()
-		fmt.Printf("\nYour room code: %s\n", roomCode)
-		fmt.Println("Share this with your partner, then wait here.")
-	case "2":
-		fmt.Print("Enter room code: ")
-		roomCode, _ = reader.ReadString('\n')
-		roomCode = strings.TrimSpace(roomCode)
-	default:
-		fmt.Println("Invalid choice.")
-		return
-	}
-
-	fmt.Println()
-
-	conn, _, err := websocket.DefaultDialer.Dial(serverURL, nil)
-	if err != nil {
-		fmt.Println("Could not connect to server:", err)
-		fmt.Println("Make sure the Render server is deployed and the URL in main.go is correct.")
-		fmt.Print("Press Enter to exit.")
-		reader.ReadString('\n')
-		return
-	}
-	defer conn.Close()
-
-	join, _ := json.Marshal(map[string]string{"type": "join", "room": roomCode})
-	conn.WriteMessage(websocket.TextMessage, join)
-	fmt.Printf("Connected! Room: %s — syncing with VLC...\n\n", roomCode)
-
-	// Receive incoming sync events from partner
+func runSync(renderConn *websocket.Conn) {
 	go func() {
 		for {
-			_, msg, err := conn.ReadMessage()
+			_, msg, err := renderConn.ReadMessage()
 			if err != nil {
-				fmt.Println("\nDisconnected from server.")
-				os.Exit(1)
+				sendUI(map[string]interface{}{"type": "server_disconnected"})
+				return
+			}
+			var raw map[string]interface{}
+			if json.Unmarshal(msg, &raw) != nil {
+				continue
+			}
+			if raw["type"] == "partner_joined" {
+				sendUI(map[string]interface{}{"type": "partner_joined"})
+				continue
 			}
 			var e syncEvent
-			if json.Unmarshal(msg, &e) == nil {
-				fmt.Printf("  <- %s @ %s\n", e.Type, fmtTime(e.Time))
+			if json.Unmarshal(msg, &e) == nil && e.Type != "" {
 				applyEvent(e)
 			}
 		}
 	}()
 
-	// Poll VLC and broadcast any state changes
 	var lastState string
 	var lastTime float64
 	var lastTick time.Time
 
 	for {
 		time.Sleep(pollInterval)
-
-		s, err := getStatus()
+		s, err := getVLCStatus()
 		if err != nil {
 			continue
 		}
@@ -275,7 +225,6 @@ func main() {
 			lastState, lastTime, lastTick = s.State, cur, now
 			continue
 		}
-
 		if isIgnoring() {
 			lastState, lastTime, lastTick = s.State, cur, now
 			continue
@@ -302,15 +251,401 @@ func main() {
 
 		if event != nil {
 			data, _ := json.Marshal(event)
-			conn.WriteMessage(websocket.TextMessage, data)
-			fmt.Printf("  -> %s @ %s\n", event.Type, fmtTime(event.Time))
+			renderConn.WriteMessage(websocket.TextMessage, data)
+			sendUI(map[string]interface{}{
+				"type": "sync_event", "direction": "sent",
+				"event": event.Type, "time": fmtTime(event.Time),
+			})
 		}
 
 		lastState, lastTime, lastTick = s.State, cur, now
 	}
 }
 
+// ── HTTP + UI WebSocket ───────────────────────────────────────────────────────
+
+var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+
+func handleUI(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+
+	uiMu.Lock()
+	uiConn = conn
+	uiMu.Unlock()
+
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			uiMu.Lock()
+			uiConn = nil
+			uiMu.Unlock()
+			return
+		}
+
+		var cmd map[string]string
+		if json.Unmarshal(msg, &cmd) != nil {
+			continue
+		}
+
+		switch cmd["type"] {
+		case "create_room":
+			code := fmt.Sprintf("%04d", rand.Intn(10000))
+			go connectToServer(code, true)
+		case "join_room":
+			go connectToServer(cmd["code"], false)
+		}
+	}
+}
+
+func connectToServer(code string, isHost bool) {
+	if isHost {
+		sendUI(map[string]interface{}{"type": "room_created", "code": code})
+	} else {
+		sendUI(map[string]interface{}{"type": "room_joined", "code": code})
+	}
+
+	conn, _, err := websocket.DefaultDialer.Dial(serverURL, nil)
+	if err != nil {
+		sendUI(map[string]interface{}{
+			"type": "error", "message": "Cannot reach server — check your internet",
+		})
+		return
+	}
+
+	join, _ := json.Marshal(map[string]string{"type": "join", "room": code})
+	conn.WriteMessage(websocket.TextMessage, join)
+	runSync(conn)
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
+func main() {
+	listener, _ := net.Listen("tcp", "127.0.0.1:0")
+	port := listener.Addr().(*net.TCPAddr).Port
+	url := fmt.Sprintf("http://127.0.0.1:%d", port)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(htmlUI))
+	})
+	mux.HandleFunc("/ui", handleUI)
+
+	go http.Serve(listener, mux)
+	go watchVLC()
+
+	exec.Command("cmd", "/c", "start", url).Start()
+
+	fmt.Printf("togetherly running at %s\nPress Ctrl+C to quit.\n", url)
+	select {}
+}
+
 func fmtTime(secs float64) string {
 	s := int(secs)
 	return fmt.Sprintf("%d:%02d:%02d", s/3600, (s%3600)/60, s%60)
 }
+
+// ── UI ────────────────────────────────────────────────────────────────────────
+
+const htmlUI = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>togetherly</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #fdf2f8;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .card {
+    background: #fff;
+    border-radius: 28px;
+    padding: 40px 36px;
+    width: 360px;
+    box-shadow: 0 12px 48px rgba(194,24,91,0.12);
+    text-align: center;
+  }
+
+  h1 {
+    font-size: 30px;
+    font-weight: 800;
+    background: linear-gradient(135deg, #e91e63, #9c27b0);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    letter-spacing: -1px;
+  }
+
+  .tagline {
+    font-size: 13px;
+    color: #bbb;
+    margin-top: 4px;
+    margin-bottom: 28px;
+  }
+
+  /* VLC status pill */
+  .vlc-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    background: #f5f5f5;
+    border-radius: 20px;
+    padding: 6px 14px;
+    font-size: 12px;
+    color: #777;
+    margin-bottom: 28px;
+    transition: all 0.3s;
+  }
+  .vlc-pill.ok { background: #e8f5e9; color: #388e3c; }
+  .vlc-pill.err { background: #fce4ec; color: #c62828; }
+
+  .dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: #ccc;
+    flex-shrink: 0;
+  }
+  .ok .dot { background: #4caf50; }
+  .err .dot { background: #e53935; animation: blink 1.4s infinite; }
+
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+  /* Buttons */
+  .btn {
+    width: 100%;
+    padding: 15px;
+    border-radius: 16px;
+    border: none;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.18s;
+    margin-bottom: 10px;
+  }
+  .btn:last-child { margin-bottom: 0; }
+
+  .btn-primary {
+    background: linear-gradient(135deg, #f06292, #ab47bc);
+    color: #fff;
+    box-shadow: 0 4px 16px rgba(194,24,91,0.2);
+  }
+  .btn-primary:hover:not(:disabled) {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px rgba(194,24,91,0.3);
+  }
+  .btn-primary:disabled { opacity: 0.45; cursor: default; }
+
+  .btn-ghost {
+    background: transparent;
+    color: #aaa;
+    font-size: 13px;
+    padding: 10px;
+  }
+  .btn-ghost:hover { color: #888; }
+
+  /* Code display */
+  .code-box {
+    background: linear-gradient(135deg, #fce4ec, #f3e5f5);
+    border-radius: 20px;
+    padding: 24px 20px 18px;
+    margin: 4px 0 20px;
+  }
+  .code-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: #ce93d8;
+    margin-bottom: 10px;
+  }
+  .code-digits {
+    font-size: 52px;
+    font-weight: 900;
+    letter-spacing: 14px;
+    color: #8e24aa;
+    line-height: 1;
+  }
+  .code-hint {
+    font-size: 12px;
+    color: #ce93d8;
+    margin-top: 10px;
+  }
+
+  /* Code input */
+  .code-input {
+    width: 100%;
+    padding: 16px 10px;
+    border: 2.5px solid #f8bbd0;
+    border-radius: 16px;
+    font-size: 40px;
+    font-weight: 800;
+    text-align: center;
+    letter-spacing: 14px;
+    color: #c2185b;
+    background: #fff9fc;
+    outline: none;
+    margin-bottom: 14px;
+    transition: border-color 0.2s;
+  }
+  .code-input:focus { border-color: #ab47bc; }
+  .code-input::placeholder { color: #f8bbd0; letter-spacing: 8px; font-size: 32px; }
+
+  /* Sync status */
+  .sync-status {
+    font-size: 14px;
+    color: #e91e63;
+    font-weight: 500;
+    min-height: 22px;
+    margin-bottom: 12px;
+  }
+
+  /* Event log */
+  .events {
+    max-height: 72px;
+    overflow: hidden;
+    margin-bottom: 16px;
+  }
+  .ev {
+    font-size: 12px;
+    padding: 2px 0;
+    color: #ccc;
+    transition: color 0.3s;
+  }
+  .ev.sent  { color: #f06292; }
+  .ev.recv  { color: #ba68c8; }
+
+  /* Sections */
+  .screen { display: none; }
+  .screen.active { display: block; }
+
+  /* Pulse for waiting */
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.45} }
+  .pulse { animation: pulse 2s ease-in-out infinite; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>togetherly</h1>
+  <p class="tagline">watch together, feel together</p>
+
+  <div class="vlc-pill" id="vlcPill">
+    <div class="dot"></div>
+    <span id="vlcText">checking VLC...</span>
+  </div>
+
+  <!-- Home -->
+  <div class="screen active" id="sHome">
+    <button class="btn btn-primary" id="btnCreate" onclick="createRoom()">Create room</button>
+    <button class="btn btn-primary" style="background:linear-gradient(135deg,#ba68c8,#7b1fa2);margin-top:2px" onclick="showJoin()">Join room</button>
+  </div>
+
+  <!-- Join -->
+  <div class="screen" id="sJoin">
+    <input class="code-input" id="codeInput" type="text" maxlength="4" placeholder="----" autocomplete="off">
+    <button class="btn btn-primary" style="background:linear-gradient(135deg,#ba68c8,#7b1fa2)" onclick="joinRoom()">Join &#9825;</button>
+    <button class="btn btn-ghost" onclick="show('sHome')">Back</button>
+  </div>
+
+  <!-- Room -->
+  <div class="screen" id="sRoom">
+    <div class="code-box" id="codeBox" style="display:none">
+      <div class="code-label">room code</div>
+      <div class="code-digits" id="codeDigits">----</div>
+      <div class="code-hint">share this with your partner</div>
+    </div>
+    <div class="sync-status pulse" id="syncStatus">Waiting for partner...</div>
+    <div class="events" id="events"></div>
+    <button class="btn btn-ghost" onclick="location.reload()">Leave room</button>
+  </div>
+</div>
+
+<script>
+const ws = new WebSocket('ws://' + location.host + '/ui');
+
+ws.onmessage = ({data}) => {
+  const m = JSON.parse(data);
+
+  if (m.type === 'vlc_status') {
+    const pill = document.getElementById('vlcPill');
+    const txt  = document.getElementById('vlcText');
+    if (m.connected) {
+      pill.className = 'vlc-pill ok';
+      txt.textContent = 'VLC connected';
+    } else {
+      pill.className = 'vlc-pill err';
+      txt.textContent = m.message || 'VLC not found';
+    }
+  }
+
+  if (m.type === 'room_created') {
+    document.getElementById('codeDigits').textContent = m.code;
+    document.getElementById('codeBox').style.display = 'block';
+    document.getElementById('syncStatus').textContent = 'Waiting for partner...';
+    document.getElementById('syncStatus').classList.add('pulse');
+    show('sRoom');
+  }
+
+  if (m.type === 'room_joined') {
+    document.getElementById('syncStatus').textContent = 'Connecting...';
+    show('sRoom');
+  }
+
+  if (m.type === 'partner_joined') {
+    document.getElementById('syncStatus').textContent = 'Partner connected ♥ Syncing...';
+    document.getElementById('syncStatus').classList.remove('pulse');
+  }
+
+  if (m.type === 'sync_event') {
+    document.getElementById('syncStatus').classList.remove('pulse');
+    document.getElementById('syncStatus').textContent =
+      m.direction === 'received' ? 'Partner ' + m.event + 'd ♥' : 'Synced ♥';
+
+    const div = document.createElement('div');
+    div.className = 'ev ' + (m.direction === 'sent' ? 'sent' : 'recv');
+    div.textContent = (m.direction === 'sent' ? '  you' : 'them') + '  ' + m.event + '  ' + m.time;
+    const log = document.getElementById('events');
+    log.prepend(div);
+    while (log.children.length > 4) log.lastChild.remove();
+  }
+
+  if (m.type === 'error') {
+    document.getElementById('syncStatus').textContent = m.message;
+    document.getElementById('syncStatus').classList.remove('pulse');
+  }
+};
+
+function show(id) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+
+function showJoin() {
+  show('sJoin');
+  document.getElementById('codeInput').focus();
+}
+
+function createRoom() { ws.send(JSON.stringify({type: 'create_room'})); }
+
+function joinRoom() {
+  const code = document.getElementById('codeInput').value;
+  if (code.length === 4) ws.send(JSON.stringify({type: 'join_room', code}));
+}
+
+// Sanitize input + auto-submit on 4 digits
+document.getElementById('codeInput').addEventListener('input', function() {
+  this.value = this.value.replace(/\D/g, '').slice(0, 4);
+  if (this.value.length === 4) joinRoom();
+});
+</script>
+</body>
+</html>`

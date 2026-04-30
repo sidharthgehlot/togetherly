@@ -19,6 +19,14 @@ wss.on('connection', (ws) => {
         if (!rooms.has(roomId)) rooms.set(roomId, new Set());
         rooms.get(roomId).add(ws);
         console.log(`joined room "${roomId}" (${rooms.get(roomId).size} connected)`);
+        // Tell existing members their partner arrived
+        if (rooms.get(roomId).size > 1) {
+          for (const client of rooms.get(roomId)) {
+            if (client !== ws && client.readyState === WebSocket.OPEN) {
+              client.send(JSON.stringify({ type: 'partner_joined' }));
+            }
+          }
+        }
         return;
       }
 
