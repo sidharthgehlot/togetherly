@@ -37,6 +37,7 @@ const (
 	serverURL     = "wss://togetherly-eqpo.onrender.com/ws"
 	updateURL     = "https://api.github.com/repos/sidharthgehlot/togetherly/releases/latest"
 	updateAsset   = "togetherly.exe"
+	updateEvery   = 72 * time.Hour
 
 	// Win32
 	wmClose        = 0x0010
@@ -65,7 +66,7 @@ const (
 	trayQuitID     = 1001
 )
 
-var appVersion = "0.2.0"
+var appVersion = "0.2.1"
 
 // ── Win32 ─────────────────────────────────────────────────────────────────────
 
@@ -124,6 +125,7 @@ var (
 
 	ignoreMu    sync.Mutex
 	ignoreUntil time.Time
+	updateMu    sync.Mutex
 )
 
 func evalUI(js string) {
@@ -632,6 +634,9 @@ func main() {
 	w.Bind("go_quit", func() {
 		quitApp(gHWND)
 	})
+	w.Bind("go_checkUpdates", func() {
+		go checkForUpdate(true)
+	})
 
 	w.Navigate(uiURL)
 
@@ -641,7 +646,7 @@ func main() {
 	})
 
 	go watchVLC()
-	go checkForUpdate()
+	go checkForUpdate(false)
 
 	w.Run()
 }
@@ -688,30 +693,78 @@ func isNewerVersion(latest, current string) bool {
 	return false
 }
 
-func checkForUpdate() {
-	time.Sleep(2 * time.Second)
+func updateCheckPath() string {
+	return filepath.Join(appDataDir(), "last-update-check.txt")
+}
+
+func shouldCheckForUpdate() bool {
+	data, err := os.ReadFile(updateCheckPath())
+	if err != nil {
+		return true
+	}
+	last, err := time.Parse(time.RFC3339, strings.TrimSpace(string(data)))
+	if err != nil {
+		return true
+	}
+	return time.Since(last) >= updateEvery
+}
+
+func markUpdateChecked() {
+	_ = os.WriteFile(updateCheckPath(), []byte(time.Now().Format(time.RFC3339)), 0644)
+}
+
+func checkForUpdate(manual bool) {
+	updateMu.Lock()
+	defer updateMu.Unlock()
+
+	if !manual {
+		time.Sleep(2 * time.Second)
+		if !shouldCheckForUpdate() {
+			return
+		}
+	}
+
+	if manual {
+		evalUI(fmt.Sprintf("updateStatus(%s)", jsStr("Checking for updates...")))
+	}
+	markUpdateChecked()
 
 	client := &http.Client{Timeout: 12 * time.Second}
 	req, err := http.NewRequest("GET", updateURL, nil)
 	if err != nil {
+		if manual {
+			evalUI(fmt.Sprintf("updateStatus(%s)", jsStr("Could not check for updates.")))
+		}
 		return
 	}
 	req.Header.Set("User-Agent", "togetherly/"+appVersion)
 
 	resp, err := client.Do(req)
 	if err != nil {
+		if manual {
+			evalUI(fmt.Sprintf("updateStatus(%s)", jsStr("Could not check for updates.")))
+		}
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		if manual {
+			evalUI(fmt.Sprintf("updateStatus(%s)", jsStr("Could not check for updates.")))
+		}
 		return
 	}
 
 	var release githubRelease
 	if json.NewDecoder(resp.Body).Decode(&release) != nil {
+		if manual {
+			evalUI(fmt.Sprintf("updateStatus(%s)", jsStr("Could not check for updates.")))
+		}
 		return
 	}
 	if !isNewerVersion(release.TagName, appVersion) {
+		if manual {
+			evalUI(fmt.Sprintf("updateStatus(%s)", jsStr("You're on the latest version.")))
+		}
 		return
 	}
 
@@ -723,6 +776,9 @@ func checkForUpdate() {
 		}
 	}
 	if downloadURL == "" {
+		if manual {
+			evalUI(fmt.Sprintf("updateStatus(%s)", jsStr("No downloadable update found.")))
+		}
 		return
 	}
 
@@ -933,6 +989,23 @@ const htmlUI = `<!DOCTYPE html>
     box-shadow: none;
   }
   .btn-ghost:hover { color: #888; }
+  .btn-small {
+    width: auto;
+    min-width: 0;
+    padding: 8px 12px;
+    border-radius: 999px;
+    margin: -18px 0 22px;
+    color: var(--purple-dark);
+    background: rgba(255,255,255,0.62);
+    border: 1px solid rgba(168,85,247,0.12);
+    box-shadow: none;
+    font-size: 11px;
+    font-weight: 700;
+  }
+  .btn-small:hover {
+    background: rgba(255,255,255,0.9);
+    transform: translateY(-1px);
+  }
 
   /* Code card */
   .code-card {
@@ -1153,6 +1226,7 @@ const htmlUI = `<!DOCTYPE html>
   <div class="dot"></div>
   <span id="pillTxt">checking VLC...</span>
 </div>
+<button class="btn btn-small" onclick="checkUpdates()">Check for updates</button>
 
 <div class="screen on" id="sHome">
   <button class="btn btn-pink"   onclick="createRoom()">Create room</button>
@@ -1204,6 +1278,13 @@ function joinRoom() {
   const c = document.getElementById('codeIn').value;
   if (c.length === 4 && window.go_joinRoom) {
     window.go_joinRoom(c);
+  }
+}
+
+function checkUpdates() {
+  updateStatus('Checking for updates...');
+  if (window.go_checkUpdates) {
+    window.go_checkUpdates();
   }
 }
 
