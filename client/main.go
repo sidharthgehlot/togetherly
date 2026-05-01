@@ -66,7 +66,7 @@ const (
 	trayQuitID     = 1001
 )
 
-var appVersion = "0.2.1"
+var appVersion = "0.3.0"
 
 // ── Win32 ─────────────────────────────────────────────────────────────────────
 
@@ -126,6 +126,8 @@ var (
 	ignoreMu    sync.Mutex
 	ignoreUntil time.Time
 	updateMu    sync.Mutex
+	connMu      sync.Mutex
+	gConn       *websocket.Conn
 )
 
 func evalUI(js string) {
@@ -154,13 +156,20 @@ func setIgnore() {
 // ── VLC ───────────────────────────────────────────────────────────────────────
 
 type vlcStatus struct {
-	Time  int    `json:"time"`
-	State string `json:"state"`
+	Time        int    `json:"time"`
+	Length      int    `json:"length"`
+	State       string `json:"state"`
+	Information struct {
+		Category map[string]map[string]string `json:"category"`
+	} `json:"information"`
 }
 
 type syncEvent struct {
-	Type string  `json:"type"`
-	Time float64 `json:"time"`
+	Type     string  `json:"type"`
+	Time     float64 `json:"time,omitempty"`
+	State    string  `json:"state,omitempty"`
+	Duration int     `json:"duration,omitempty"`
+	Filename string  `json:"filename,omitempty"`
 }
 
 type githubRelease struct {
@@ -185,11 +194,74 @@ func getVLCStatus() (*vlcStatus, error) {
 	return &s, json.Unmarshal(body, &s)
 }
 
+func mediaFilename(s *vlcStatus) string {
+	if s == nil || s.Information.Category == nil {
+		return ""
+	}
+	if meta, ok := s.Information.Category["meta"]; ok {
+		if filename := meta["filename"]; filename != "" {
+			return filename
+		}
+		if title := meta["title"]; title != "" {
+			return title
+		}
+	}
+	return ""
+}
+
 func vlcCommand(cmd string) {
 	client := &http.Client{Timeout: 1 * time.Second}
 	req, _ := http.NewRequest("GET", vlcBase+"?"+cmd, nil)
 	req.SetBasicAuth("", vlcPass)
 	client.Do(req)
+}
+
+func writeSyncEvent(conn *websocket.Conn, e syncEvent) error {
+	if conn == nil {
+		return fmt.Errorf("not connected")
+	}
+	data, _ := json.Marshal(e)
+	connMu.Lock()
+	defer connMu.Unlock()
+	return conn.WriteMessage(websocket.TextMessage, data)
+}
+
+func currentConn() *websocket.Conn {
+	connMu.Lock()
+	defer connMu.Unlock()
+	return gConn
+}
+
+func setCurrentConn(conn *websocket.Conn) {
+	connMu.Lock()
+	defer connMu.Unlock()
+	gConn = conn
+}
+
+func sendLocalStatus(conn *websocket.Conn) {
+	s, err := getVLCStatus()
+	if err != nil {
+		return
+	}
+	_ = writeSyncEvent(conn, syncEvent{
+		Type:     "status",
+		Time:     float64(s.Time),
+		State:    s.State,
+		Duration: s.Length,
+		Filename: mediaFilename(s),
+	})
+}
+
+func sendCurrentPlayback(conn *websocket.Conn) {
+	s, err := getVLCStatus()
+	if err != nil {
+		return
+	}
+	t := "pause"
+	if s.State == "playing" {
+		t = "play"
+	}
+	_ = writeSyncEvent(conn, syncEvent{Type: t, Time: float64(s.Time)})
 }
 
 func applyEvent(e syncEvent) {
@@ -251,8 +323,15 @@ func autoConfigureVLC() error {
 func watchVLC() {
 	configured := false
 	for {
-		if _, err := getVLCStatus(); err == nil {
-			evalUI("vlcStatus(true, 'VLC connected')")
+		if s, err := getVLCStatus(); err == nil {
+			evalUI(fmt.Sprintf(
+				"localVlcStatus(true,%s,%s,%d,%s,%s)",
+				jsStr("VLC connected"),
+				jsStr(mediaFilename(s)),
+				s.Length,
+				jsStr(fmtTime(float64(s.Time))),
+				jsStr(s.State),
+			))
 			time.Sleep(3 * time.Second)
 			continue
 		}
@@ -260,7 +339,7 @@ func watchVLC() {
 			autoConfigureVLC()
 			configured = true
 		}
-		evalUI("vlcStatus(false, 'Waiting for VLC')")
+		evalUI("localVlcStatus(false, 'Waiting for VLC', '', 0, '', '')")
 		time.Sleep(2 * time.Second)
 	}
 }
@@ -279,14 +358,23 @@ func connectAndSync(code string, isHost bool) {
 		evalUI(fmt.Sprintf("showError(%s)", jsStr("Cannot reach server")))
 		return
 	}
+	setCurrentConn(conn)
+	evalUI("relayStatus(true)")
 
 	join, _ := json.Marshal(map[string]string{"type": "join", "room": code})
-	conn.WriteMessage(websocket.TextMessage, join)
+	connMu.Lock()
+	_ = conn.WriteMessage(websocket.TextMessage, join)
+	connMu.Unlock()
+	sendLocalStatus(conn)
 
 	go func() {
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
+				if currentConn() == conn {
+					setCurrentConn(nil)
+				}
+				evalUI("relayStatus(false)")
 				evalUI("showError('Disconnected')")
 				return
 			}
@@ -308,6 +396,25 @@ func connectAndSync(code string, isHost bool) {
 			}
 			var e syncEvent
 			if json.Unmarshal(msg, &e) == nil && e.Type != "" {
+				switch e.Type {
+				case "ready":
+					evalUI("partnerReady()")
+					continue
+				case "status":
+					evalUI(fmt.Sprintf(
+						"partnerStatus(%s,%d,%s,%s,%s)",
+						jsStr(e.Filename),
+						e.Duration,
+						jsStr(fmtTime(e.Time)),
+						jsStr(e.State),
+						jsStr(fmtTime(float64(e.Duration))),
+					))
+					continue
+				case "sync_request":
+					sendCurrentPlayback(conn)
+					sendLocalStatus(conn)
+					continue
+				}
 				applyEvent(e)
 			}
 		}
@@ -316,6 +423,7 @@ func connectAndSync(code string, isHost bool) {
 	var lastState string
 	var lastTime float64
 	var lastTick time.Time
+	lastStatusSent := time.Time{}
 
 	for {
 		time.Sleep(pollInterval)
@@ -328,6 +436,8 @@ func connectAndSync(code string, isHost bool) {
 
 		if lastState == "" {
 			lastState, lastTime, lastTick = s.State, cur, now
+			sendLocalStatus(conn)
+			lastStatusSent = now
 			continue
 		}
 		if isIgnoring() {
@@ -355,9 +465,12 @@ func connectAndSync(code string, isHost bool) {
 		}
 
 		if event != nil {
-			data, _ := json.Marshal(event)
-			conn.WriteMessage(websocket.TextMessage, data)
+			_ = writeSyncEvent(conn, *event)
 			evalUI(fmt.Sprintf("syncEvent('sent',%s,%s)", jsStr(event.Type), jsStr(fmtTime(event.Time))))
+		}
+		if now.Sub(lastStatusSent) > 5*time.Second {
+			sendLocalStatus(conn)
+			lastStatusSent = now
 		}
 
 		lastState, lastTime, lastTick = s.State, cur, now
@@ -621,7 +734,7 @@ func main() {
 	gView = w
 
 	w.SetTitle("togetherly")
-	w.SetSize(420, 640, webview.HintFixed) // sized for the room screen and activity feed
+	w.SetSize(430, 760, webview.HintFixed) // sized for diagnostics, room controls, and activity feed
 
 	// Register bindings BEFORE navigation so they're available on first load
 	w.Bind("go_createRoom", func() {
@@ -636,6 +749,17 @@ func main() {
 	})
 	w.Bind("go_checkUpdates", func() {
 		go checkForUpdate(true)
+	})
+	w.Bind("go_ready", func() {
+		if conn := currentConn(); conn != nil {
+			_ = writeSyncEvent(conn, syncEvent{Type: "ready"})
+		}
+	})
+	w.Bind("go_syncNow", func() {
+		if conn := currentConn(); conn != nil {
+			_ = writeSyncEvent(conn, syncEvent{Type: "sync_request"})
+			sendLocalStatus(conn)
+		}
 	})
 
 	w.Navigate(uiURL)
@@ -1006,6 +1130,77 @@ const htmlUI = `<!DOCTYPE html>
     background: rgba(255,255,255,0.9);
     transform: translateY(-1px);
   }
+  .btn-row {
+    width: 100%;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  .btn-row .btn {
+    margin: 0;
+    padding: 12px 10px;
+    border-radius: 14px;
+    font-size: 12px;
+  }
+  .btn-soft {
+    color: var(--pink-dark);
+    background: rgba(255,255,255,0.72);
+    border: 1px solid rgba(190,24,93,0.10);
+    box-shadow: none;
+  }
+  .btn-soft:hover {
+    background: rgba(255,255,255,0.94);
+    transform: translateY(-1px);
+  }
+  .setup-card, .health-card {
+    width: 100%;
+    background: rgba(255,255,255,0.68);
+    border: 1px solid rgba(190,24,93,0.08);
+    border-radius: 18px;
+    padding: 12px;
+    box-shadow: 0 6px 18px rgba(190,24,93,0.06);
+  }
+  .setup-card {
+    margin-top: 4px;
+  }
+  .setup-title, .health-title {
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 1px;
+    color: var(--text-soft);
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+  .check-list {
+    display: grid;
+    gap: 7px;
+  }
+  .check-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--text);
+  }
+  .check-dot {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: #d8c9d5;
+    flex: 0 0 auto;
+    margin-right: 6px;
+  }
+  .check-item.ok .check-dot { background: #22c55e; box-shadow: 0 0 8px rgba(34,197,94,0.35); }
+  .check-item.warn .check-dot { background: #f59e0b; }
+  .check-value {
+    color: var(--text-soft);
+    font-weight: 700;
+    text-align: right;
+  }
 
   /* Code card */
   .code-card {
@@ -1116,6 +1311,38 @@ const htmlUI = `<!DOCTYPE html>
   }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.45} }
   .pulse { animation: pulse 2s infinite; }
+  .health-card {
+    margin-bottom: 12px;
+  }
+  .health-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  .health-item {
+    min-height: 44px;
+    border-radius: 14px;
+    background: rgba(255,255,255,0.62);
+    border: 1px solid rgba(168,85,247,0.08);
+    padding: 8px;
+  }
+  .health-label {
+    font-size: 9px;
+    font-weight: 800;
+    color: var(--text-soft);
+    letter-spacing: 0.7px;
+    text-transform: uppercase;
+  }
+  .health-value {
+    margin-top: 3px;
+    font-size: 11px;
+    font-weight: 800;
+    color: var(--text);
+    line-height: 1.2;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 
   /* Activity */
   .activity-title {
@@ -1231,6 +1458,14 @@ const htmlUI = `<!DOCTYPE html>
 <div class="screen on" id="sHome">
   <button class="btn btn-pink"   onclick="createRoom()">Create room</button>
   <button class="btn btn-purple" onclick="showJoin()">Join room</button>
+  <div class="setup-card">
+    <div class="setup-title">setup check</div>
+    <div class="check-list">
+      <div class="check-item warn" id="setupVlc"><span><span class="check-dot"></span> VLC control</span><span class="check-value" id="setupVlcTxt">checking</span></div>
+      <div class="check-item warn" id="setupMedia"><span><span class="check-dot"></span> Open video</span><span class="check-value" id="setupMediaTxt">waiting</span></div>
+      <div class="check-item warn" id="setupRelay"><span><span class="check-dot"></span> Room relay</span><span class="check-value" id="setupRelayTxt">join room</span></div>
+    </div>
+  </div>
 </div>
 
 <div class="screen" id="sJoin">
@@ -1245,6 +1480,14 @@ const htmlUI = `<!DOCTYPE html>
     <div class="code-digits" id="codeDigits">----</div>
     <div class="code-hint">share with your partner</div>
   </div>
+  <div class="btn-row">
+    <button class="btn btn-soft" onclick="copyInvite()">Copy invite</button>
+    <button class="btn btn-soft" onclick="markReady()">I'm ready</button>
+  </div>
+  <div class="btn-row">
+    <button class="btn btn-soft" onclick="syncNow()">Sync me now</button>
+    <button class="btn btn-soft" onclick="window.go_quit && window.go_quit()">Quit</button>
+  </div>
   <div class="sync-card">
     <div class="sync-row">
       <div class="state-indicator pulse" id="stateIcon">...</div>
@@ -1254,14 +1497,28 @@ const htmlUI = `<!DOCTYPE html>
       </div>
     </div>
   </div>
+  <div class="health-card">
+    <div class="health-title">watch room health</div>
+    <div class="health-grid">
+      <div class="health-item"><div class="health-label">You</div><div class="health-value" id="youHealth">VLC checking</div></div>
+      <div class="health-item"><div class="health-label">Partner</div><div class="health-value" id="partnerHealth">Waiting</div></div>
+      <div class="health-item"><div class="health-label">Video match</div><div class="health-value" id="matchHealth">Unknown</div></div>
+      <div class="health-item"><div class="health-label">Ready</div><div class="health-value" id="readyHealth">Not ready</div></div>
+    </div>
+  </div>
   <div class="activity-title"><span>recent syncs</span><span id="activityCount">0 events</span></div>
   <div class="events" id="events">
     <div class="empty-feed">Play, pause, or seek in VLC and the latest sync actions will appear here.</div>
   </div>
-  <button class="btn btn-ghost" onclick="window.go_quit && window.go_quit()">Quit</button>
 </div>
 
 <script>
+let roomCode = '';
+let localInfo = { ok: false, filename: '', duration: 0, time: '', state: '' };
+let partnerInfo = { online: false, filename: '', duration: 0, time: '', state: '' };
+let localReady = false;
+let remoteReady = false;
+
 function show(id) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('on'));
   document.getElementById(id).classList.add('on');
@@ -1288,6 +1545,27 @@ function checkUpdates() {
   }
 }
 
+function copyInvite() {
+  const text = 'Join my togetherly room: ' + roomCode + '\nDownload togetherly: https://github.com/sidharthgehlot/togetherly/releases/latest';
+  navigator.clipboard.writeText(text).then(function() {
+    setStatus('Invite copied', 'Send it to your partner, then both of you open the same video in VLC.', 'OK', false);
+  }).catch(function() {
+    setStatus('Room code ' + roomCode, 'Copy this code and send it to your partner.', 'OK', false);
+  });
+}
+
+function markReady() {
+  localReady = true;
+  updateReady();
+  addActivity('sent', 'ready', 'now');
+  if (window.go_ready) window.go_ready();
+}
+
+function syncNow() {
+  setStatus('Asking partner for their current spot', 'If their VLC is connected, your player will match their timeline.', '>>', true);
+  if (window.go_syncNow) window.go_syncNow();
+}
+
 document.getElementById('codeIn').addEventListener('input', function() {
   this.value = this.value.replace(/\D/g, '').slice(0, 4);
   if (this.value.length === 4) joinRoom();
@@ -1295,37 +1573,113 @@ document.getElementById('codeIn').addEventListener('input', function() {
 
 // Called from Go
 function vlcStatus(ok, msg) {
+  localVlcStatus(ok, msg, '', 0, '', '');
+}
+function localVlcStatus(ok, msg, filename, duration, time, state) {
+  localInfo = { ok: ok, filename: filename || '', duration: duration || 0, time: time || '', state: state || '' };
   const p = document.getElementById('pill');
   p.className = 'pill ' + (ok ? 'ok' : 'err');
   document.getElementById('pillTxt').textContent = msg;
+  setCheck('setupVlc', 'setupVlcTxt', ok, ok ? 'ready' : 'waiting');
+  setCheck('setupMedia', 'setupMediaTxt', ok && duration > 0, duration > 0 ? fmtDuration(duration) : 'open VLC');
+  document.getElementById('youHealth').textContent = ok ? ((filename || 'video open') + (time ? ' @ ' + time : '')) : 'VLC waiting';
+  updateMatchHealth();
 }
 function updateStatus(msg) {
   const p = document.getElementById('pill');
   p.className = 'pill ok';
   document.getElementById('pillTxt').textContent = msg;
 }
+function relayStatus(ok) {
+  setCheck('setupRelay', 'setupRelayTxt', ok, ok ? 'connected' : 'offline');
+}
 function roomCreated(code) {
+  roomCode = code;
+  localReady = false;
+  remoteReady = false;
   document.getElementById('codeDigits').textContent = code;
   document.getElementById('codeBox').style.display = 'block';
   resetActivity();
+  updateReady();
   setStatus('Waiting for partner...', 'Share the code, then start the movie in VLC when they join.', '...', true);
   show('sRoom');
 }
 function roomJoined(code) {
+  roomCode = code;
+  localReady = false;
+  remoteReady = false;
   document.getElementById('codeBox').style.display = 'none';
   resetActivity();
+  updateReady();
   setStatus('Joining room ' + code + '...', 'Checking the room and waiting for your partner connection.', '...', true);
   show('sRoom');
 }
 function partnerJoined() {
+  partnerInfo.online = true;
+  document.getElementById('partnerHealth').textContent = 'Connected';
   setStatus('Connected together', 'You can play, pause, or seek in VLC. Changes will sync both ways.', 'OK', false);
 }
 function partnerLeft() {
+  partnerInfo.online = false;
+  remoteReady = false;
+  document.getElementById('partnerHealth').textContent = 'Disconnected';
+  updateReady();
   setStatus('Partner disconnected', 'The room is still open. Ask them to join again with the same code.', '!', true);
   addActivity('recv', 'left', 'now');
 }
 function roomFull() {
   setStatus('Room is already full', 'Check the code and try again, or create a fresh room.', '!', false);
+}
+function partnerReady() {
+  remoteReady = true;
+  updateReady();
+  addActivity('recv', 'ready', 'now');
+  setStatus(localReady ? 'Both ready' : 'Partner is ready', localReady ? 'Start VLC when you are ready to watch.' : "Tap I'm ready when your video is open.", 'OK', false);
+}
+function partnerStatus(filename, duration, time, state, durationText) {
+  partnerInfo = { online: true, filename: filename || '', duration: duration || 0, time: time || '', state: state || '' };
+  document.getElementById('partnerHealth').textContent = (filename || 'VLC connected') + (time ? ' @ ' + time : '');
+  updateMatchHealth();
+}
+
+function setCheck(rowId, textId, ok, text) {
+  const row = document.getElementById(rowId);
+  row.className = 'check-item ' + (ok ? 'ok' : 'warn');
+  document.getElementById(textId).textContent = text;
+}
+
+function fmtDuration(seconds) {
+  seconds = Number(seconds || 0);
+  if (!seconds) return 'unknown';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  return h ? h + 'h ' + m + 'm' : m + 'm';
+}
+
+function updateReady() {
+  let label = 'Not ready';
+  if (localReady && remoteReady) label = 'Both ready';
+  else if (localReady) label = 'You are ready';
+  else if (remoteReady) label = 'Partner ready';
+  document.getElementById('readyHealth').textContent = label;
+}
+
+function updateMatchHealth() {
+  const el = document.getElementById('matchHealth');
+  if (!el) return;
+  if (!localInfo.duration || !partnerInfo.duration) {
+    el.textContent = 'Unknown';
+    return;
+  }
+  const diff = Math.abs(localInfo.duration - partnerInfo.duration);
+  if (diff <= 2) {
+    el.textContent = 'Looks same';
+  } else if (diff <= 10) {
+    el.textContent = 'Close duration';
+  } else {
+    el.textContent = 'May differ';
+    setStatus('Videos may be different', 'Your VLC duration does not match your partner. Check that both files are the same cut.', '!', false);
+  }
 }
 
 function syncEvent(dir, event, time) {
@@ -1378,6 +1732,15 @@ function eventInfo(event) {
       partnerTitle: 'Partner left the room',
       youStatus: 'Connection changed',
       partnerStatus: 'Partner left'
+    };
+  }
+  if (event === 'ready') {
+    return {
+      icon: 'OK',
+      youTitle: 'You are ready',
+      partnerTitle: 'Partner is ready',
+      youStatus: 'You are ready',
+      partnerStatus: 'Partner is ready'
     };
   }
   return {

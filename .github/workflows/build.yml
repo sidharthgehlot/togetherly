@@ -28,7 +28,7 @@ jobs:
         working-directory: client
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then VERSION="0.2.1"; fi
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then VERSION="0.3.0"; fi
           GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -X main.appVersion=${VERSION}" -o togetherly.exe .
 
       - name: Upload artifact

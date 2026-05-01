@@ -10,6 +10,10 @@ Create a room, share a 4-digit code, open the same video in VLC, and togetherly 
 - Works with VLC Media Player on Windows
 - Syncs play, pause, and timeline seeking between two people
 - Simple 4-digit room codes
+- Copyable invite text
+- Ready state and manual "sync me now" recovery
+- Same-video duration check
+- Clear VLC, relay, partner, and room health status
 - Lightweight Windows EXE
 - Runs quietly in the system tray
 - Right-click tray menu with Quit
@@ -36,7 +40,7 @@ togetherly is designed for people searching for:
 3. The other person joins with the 4-digit code.
 4. Play, pause, and seek actions sync both ways.
 
-togetherly configures VLC's HTTP interface when needed, using the local VLC web API on your own computer. The server only relays sync events between people in the same room.
+togetherly configures VLC's HTTP interface when needed, using the local VLC web API on your own computer. The server only relays room and sync metadata between people in the same room.
 
 ## Download
 
@@ -74,7 +78,7 @@ Build the Windows app:
 
 ```powershell
 cd client
-go build -ldflags="-s -w -X main.appVersion=0.2.1" -o togetherly.exe .
+go build -ldflags="-s -w -X main.appVersion=0.3.0" -o togetherly.exe .
 ```
 
 Run the relay server:
@@ -87,7 +91,7 @@ npm start
 
 ## Privacy
 
-togetherly does not stream your video. It only sends small playback events such as play, pause, seek, and timestamp through the relay server.
+togetherly does not stream your video. It sends small room metadata through the relay server, including play, pause, seek, timestamp, ready status, and video filename/title plus duration for the same-video check.
 
 ## Keywords
 
