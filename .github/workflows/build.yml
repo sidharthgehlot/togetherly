@@ -3,7 +3,12 @@ name: Build togetherly.exe
 on:
   push:
     branches: [master, main]
+    tags:
+      - "v*"
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -21,10 +26,19 @@ jobs:
 
       - name: Build Windows .exe
         working-directory: client
-        run: GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o togetherly.exe .
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then VERSION="0.2.0"; fi
+          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -X main.appVersion=${VERSION}" -o togetherly.exe .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: togetherly-windows
           path: client/togetherly.exe
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: client/togetherly.exe

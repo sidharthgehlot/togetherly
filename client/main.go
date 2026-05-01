@@ -35,26 +35,37 @@ const (
 	pollInterval  = 500 * time.Millisecond
 	seekThreshold = 3.0
 	serverURL     = "wss://togetherly-eqpo.onrender.com/ws"
+	updateURL     = "https://api.github.com/repos/sidharthgehlot/togetherly/releases/latest"
+	updateAsset   = "togetherly.exe"
 
 	// Win32
-	wmClose         = 0x0010
-	wmTrayIcon      = 0x8001
-	wmLButtonUp     = 0x0202
-	wmSetIcon       = 0x0080
-	gwlpWndProc     = ^uintptr(3)
-	swHide          = 0
-	swRestore       = 9
-	nimAdd          = 0
-	nimDelete       = 2
-	nifMessage      = 1
-	nifIcon         = 2
-	nifTip          = 4
-	idiApp          = uintptr(32512)
-	iconSmall       = 0
-	iconBig         = 1
-	imageIcon       = 1
-	lrLoadFromFile  = 0x00000010
+	wmClose        = 0x0010
+	wmCommand      = 0x0111
+	wmTrayIcon     = 0x8001
+	wmLButtonUp    = 0x0202
+	wmRButtonUp    = 0x0205
+	wmNull         = 0x0000
+	wmSetIcon      = 0x0080
+	gwlpWndProc    = ^uintptr(3)
+	swHide         = 0
+	swRestore      = 9
+	nimAdd         = 0
+	nimDelete      = 2
+	nifMessage     = 1
+	nifIcon        = 2
+	nifTip         = 4
+	idiApp         = uintptr(32512)
+	iconSmall      = 0
+	iconBig        = 1
+	imageIcon      = 1
+	lrLoadFromFile = 0x00000010
+	mfString       = 0x00000000
+	tpmRightButton = 0x0002
+	tpmReturnCmd   = 0x0100
+	trayQuitID     = 1001
 )
+
+var appVersion = "0.2.0"
 
 // ── Win32 ─────────────────────────────────────────────────────────────────────
 
@@ -70,6 +81,12 @@ var (
 	loadIcon      = user32.NewProc("LoadIconW")
 	loadImage     = user32.NewProc("LoadImageW")
 	sendMessage   = user32.NewProc("SendMessageW")
+	postMessage   = user32.NewProc("PostMessageW")
+	getCursorPos  = user32.NewProc("GetCursorPos")
+	createPopup   = user32.NewProc("CreatePopupMenu")
+	appendMenu    = user32.NewProc("AppendMenuW")
+	trackPopup    = user32.NewProc("TrackPopupMenu")
+	destroyMenu   = user32.NewProc("DestroyMenu")
 	shellNotify   = shell32.NewProc("Shell_NotifyIconW")
 )
 
@@ -91,6 +108,11 @@ type notifyIconData struct {
 	SzInfoTitle      [64]uint16
 	DwInfoFlags      uint32
 	_                [4]byte
+}
+
+type point struct {
+	X int32
+	Y int32
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -137,6 +159,14 @@ type vlcStatus struct {
 type syncEvent struct {
 	Type string  `json:"type"`
 	Time float64 `json:"time"`
+}
+
+type githubRelease struct {
+	TagName string `json:"tag_name"`
+	Assets  []struct {
+		Name               string `json:"name"`
+		BrowserDownloadURL string `json:"browser_download_url"`
+	} `json:"assets"`
 }
 
 func getVLCStatus() (*vlcStatus, error) {
@@ -266,6 +296,14 @@ func connectAndSync(code string, isHost bool) {
 				evalUI("partnerJoined()")
 				continue
 			}
+			if raw["type"] == "partner_left" {
+				evalUI("partnerLeft()")
+				continue
+			}
+			if raw["type"] == "room_full" {
+				evalUI("roomFull()")
+				continue
+			}
 			var e syncEvent
 			if json.Unmarshal(msg, &e) == nil && e.Type != "" {
 				applyEvent(e)
@@ -367,12 +405,12 @@ func makeHeartIcon() (string, error) {
 	binary.Write(&ico, binary.LittleEndian, uint16(1)) // count
 	ico.WriteByte(sz)
 	ico.WriteByte(sz)
-	ico.WriteByte(0) // colors
-	ico.WriteByte(0) // reserved
-	binary.Write(&ico, binary.LittleEndian, uint16(1))               // planes
-	binary.Write(&ico, binary.LittleEndian, uint16(32))              // bpp
-	binary.Write(&ico, binary.LittleEndian, uint32(len(pngData)))    // bytes
-	binary.Write(&ico, binary.LittleEndian, uint32(22))              // offset
+	ico.WriteByte(0)                                              // colors
+	ico.WriteByte(0)                                              // reserved
+	binary.Write(&ico, binary.LittleEndian, uint16(1))            // planes
+	binary.Write(&ico, binary.LittleEndian, uint16(32))           // bpp
+	binary.Write(&ico, binary.LittleEndian, uint32(len(pngData))) // bytes
+	binary.Write(&ico, binary.LittleEndian, uint32(22))           // offset
 	ico.Write(pngData)
 
 	icoPath := filepath.Join(appDataDir(), "togetherly.ico")
@@ -465,7 +503,7 @@ func addTrayIcon(hwnd uintptr) {
 	nid.UFlags = nifMessage | nifIcon | nifTip
 	nid.UCallbackMessage = wmTrayIcon
 	nid.HIcon = icon
-	tip := windows.StringToUTF16("togetherly — click to open")
+	tip := windows.StringToUTF16("togetherly - left-click to open, right-click to quit")
 	copy(nid.SzTip[:], tip)
 	shellNotify.Call(nimAdd, uintptr(unsafe.Pointer(&nid)))
 }
@@ -478,15 +516,59 @@ func removeTrayIcon(hwnd uintptr) {
 	shellNotify.Call(nimDelete, uintptr(unsafe.Pointer(&nid)))
 }
 
+func quitApp(hwnd uintptr) {
+	removeTrayIcon(hwnd)
+	if gView != nil {
+		gView.Terminate()
+	}
+}
+
+func showTrayMenu(hwnd uintptr) {
+	menu, _, _ := createPopup.Call()
+	if menu == 0 {
+		return
+	}
+	defer destroyMenu.Call(menu)
+
+	quitText := windows.StringToUTF16("Quit togetherly")
+	appendMenu.Call(menu, mfString, trayQuitID, uintptr(unsafe.Pointer(&quitText[0])))
+
+	var pt point
+	getCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+	setForeground.Call(hwnd)
+	cmd, _, _ := trackPopup.Call(
+		menu,
+		tpmRightButton|tpmReturnCmd,
+		uintptr(pt.X),
+		uintptr(pt.Y),
+		0,
+		hwnd,
+		0,
+	)
+	postMessage.Call(hwnd, wmNull, 0, 0)
+
+	if cmd == trayQuitID {
+		quitApp(hwnd)
+	}
+}
+
 func wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 	switch msg {
 	case wmClose:
 		showWin.Call(hwnd, swHide)
 		return 0
+	case wmCommand:
+		if wParam&0xffff == trayQuitID {
+			quitApp(hwnd)
+			return 0
+		}
 	case wmTrayIcon:
 		if lParam == wmLButtonUp {
 			showWin.Call(hwnd, swRestore)
 			setForeground.Call(hwnd)
+		}
+		if lParam == wmRButtonUp {
+			showTrayMenu(hwnd)
 		}
 		return 0
 	}
@@ -537,7 +619,7 @@ func main() {
 	gView = w
 
 	w.SetTitle("togetherly")
-	w.SetSize(400, 580, webview.HintFixed) // sized for the tallest screen (Room with code)
+	w.SetSize(420, 640, webview.HintFixed) // sized for the room screen and activity feed
 
 	// Register bindings BEFORE navigation so they're available on first load
 	w.Bind("go_createRoom", func() {
@@ -548,8 +630,7 @@ func main() {
 		go connectAndSync(code, false)
 	})
 	w.Bind("go_quit", func() {
-		removeTrayIcon(gHWND)
-		w.Terminate()
+		quitApp(gHWND)
 	})
 
 	w.Navigate(uiURL)
@@ -560,6 +641,7 @@ func main() {
 	})
 
 	go watchVLC()
+	go checkForUpdate()
 
 	w.Run()
 }
@@ -567,6 +649,151 @@ func main() {
 func fmtTime(secs float64) string {
 	s := int(secs)
 	return fmt.Sprintf("%d:%02d:%02d", s/3600, (s%3600)/60, s%60)
+}
+
+func cleanVersion(v string) string {
+	v = strings.TrimSpace(v)
+	v = strings.TrimPrefix(v, "v")
+	return v
+}
+
+func versionParts(v string) []int {
+	v = cleanVersion(v)
+	pieces := strings.Split(v, ".")
+	out := make([]int, 3)
+	for i := 0; i < len(out) && i < len(pieces); i++ {
+		n := 0
+		for _, r := range pieces[i] {
+			if r < '0' || r > '9' {
+				break
+			}
+			n = n*10 + int(r-'0')
+		}
+		out[i] = n
+	}
+	return out
+}
+
+func isNewerVersion(latest, current string) bool {
+	if current == "" || current == "dev" {
+		return false
+	}
+	a := versionParts(latest)
+	b := versionParts(current)
+	for i := range a {
+		if a[i] != b[i] {
+			return a[i] > b[i]
+		}
+	}
+	return false
+}
+
+func checkForUpdate() {
+	time.Sleep(2 * time.Second)
+
+	client := &http.Client{Timeout: 12 * time.Second}
+	req, err := http.NewRequest("GET", updateURL, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("User-Agent", "togetherly/"+appVersion)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+
+	var release githubRelease
+	if json.NewDecoder(resp.Body).Decode(&release) != nil {
+		return
+	}
+	if !isNewerVersion(release.TagName, appVersion) {
+		return
+	}
+
+	downloadURL := ""
+	for _, asset := range release.Assets {
+		if asset.Name == updateAsset {
+			downloadURL = asset.BrowserDownloadURL
+			break
+		}
+	}
+	if downloadURL == "" {
+		return
+	}
+
+	evalUI(fmt.Sprintf("updateStatus(%s)", jsStr("Updating to "+release.TagName+"...")))
+	updatePath, err := downloadUpdate(client, downloadURL, release.TagName)
+	if err != nil {
+		evalUI(fmt.Sprintf("updateStatus(%s)", jsStr("Update failed. Download the latest exe manually.")))
+		return
+	}
+	evalUI(fmt.Sprintf("updateStatus(%s)", jsStr("Update ready. Restarting...")))
+	installUpdate(updatePath)
+}
+
+func downloadUpdate(client *http.Client, downloadURL, version string) (string, error) {
+	req, err := http.NewRequest("GET", downloadURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "togetherly/"+appVersion)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("download failed: %s", resp.Status)
+	}
+
+	updateDir := filepath.Join(appDataDir(), "updates")
+	if err := os.MkdirAll(updateDir, 0755); err != nil {
+		return "", err
+	}
+	updatePath := filepath.Join(updateDir, "togetherly-"+cleanVersion(version)+".exe")
+	f, err := os.Create(updatePath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		return "", err
+	}
+	return updatePath, nil
+}
+
+func installUpdate(updatePath string) {
+	exePath, err := os.Executable()
+	if err != nil {
+		return
+	}
+
+	script := fmt.Sprintf(`
+$pidToWait = %d
+$src = '%s'
+$dst = '%s'
+Start-Sleep -Milliseconds 500
+Wait-Process -Id $pidToWait -ErrorAction SilentlyContinue
+Copy-Item -LiteralPath $src -Destination $dst -Force
+Start-Process -FilePath $dst -WorkingDirectory '%s'
+`, os.Getpid(), psEscape(updatePath), psEscape(exePath), psEscape(filepath.Dir(exePath)))
+
+	cmd := exec.Command("powershell",
+		"-NoProfile", "-NonInteractive",
+		"-ExecutionPolicy", "Bypass",
+		"-WindowStyle", "Hidden",
+		"-Command", script)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+	if cmd.Start() == nil {
+		quitApp(gHWND)
+	}
 }
 
 // ── HTML UI ───────────────────────────────────────────────────────────────────
@@ -772,36 +999,128 @@ const htmlUI = `<!DOCTYPE html>
     font-size: 30px;
   }
 
-  /* Status text */
-  .status-text {
-    font-size: 13px;
-    font-weight: 600;
+  /* Room state */
+  .sync-card {
+    width: 100%;
+    background: rgba(255, 255, 255, 0.78);
+    border: 1px solid rgba(190, 24, 93, 0.10);
+    border-radius: 18px;
+    padding: 14px;
+    margin-bottom: 14px;
+    box-shadow: 0 8px 24px rgba(190, 24, 93, 0.08);
+  }
+  .sync-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .state-indicator {
+    width: 38px;
+    height: 38px;
+    border-radius: 14px;
+    display: grid;
+    place-items: center;
+    background: linear-gradient(135deg, rgba(236,72,153,0.14), rgba(168,85,247,0.16));
     color: var(--pink-dark);
-    text-align: center;
-    margin: 4px 0 14px;
+    font-size: 16px;
+    font-weight: 900;
+    flex: 0 0 auto;
+  }
+  .state-copy { min-width: 0; flex: 1; }
+  .status-text {
+    font-size: 14px;
+    font-weight: 800;
+    color: var(--text);
+    line-height: 1.25;
     min-height: 18px;
-    letter-spacing: 0.2px;
+  }
+  .status-detail {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-soft);
+    line-height: 1.35;
+    margin-top: 3px;
   }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.45} }
   .pulse { animation: pulse 2s infinite; }
 
-  /* Events */
+  /* Activity */
+  .activity-title {
+    width: 100%;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin: 2px 0 8px;
+    color: var(--text-soft);
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 1.1px;
+    text-transform: uppercase;
+  }
+  .activity-title span:last-child {
+    letter-spacing: 0;
+    text-transform: none;
+    font-size: 10px;
+    font-weight: 700;
+  }
   .events {
     width: 100%;
-    max-height: 60px;
+    min-height: 132px;
+    max-height: 132px;
     overflow: hidden;
     margin-bottom: 14px;
-    text-align: center;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
   }
   .ev {
-    font-size: 11px;
-    color: #d4c5d0;
-    padding: 1px 0;
-    font-weight: 500;
-    letter-spacing: 0.3px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    min-height: 38px;
+    padding: 8px 10px;
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.62);
+    border: 1px solid rgba(190, 24, 93, 0.06);
+    animation: slideIn 0.22s ease-out;
   }
-  .ev.sent { color: var(--pink); }
-  .ev.recv { color: var(--purple); }
+  .ev-icon {
+    width: 24px;
+    height: 24px;
+    border-radius: 9px;
+    display: grid;
+    place-items: center;
+    font-size: 11px;
+    font-weight: 900;
+    flex: 0 0 auto;
+  }
+  .ev.sent .ev-icon { background: rgba(236,72,153,0.12); color: var(--pink-dark); }
+  .ev.recv .ev-icon { background: rgba(168,85,247,0.13); color: var(--purple-dark); }
+  .ev-main { min-width: 0; flex: 1; }
+  .ev-title {
+    font-size: 12px;
+    font-weight: 800;
+    color: var(--text);
+    line-height: 1.2;
+  }
+  .ev-meta {
+    font-size: 10px;
+    color: var(--text-soft);
+    font-weight: 600;
+    margin-top: 2px;
+  }
+  .empty-feed {
+    height: 100%;
+    display: grid;
+    place-items: center;
+    color: var(--text-soft);
+    font-size: 11px;
+    font-weight: 600;
+    text-align: center;
+    padding: 0 28px;
+  }
+  @keyframes slideIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
 
   /* Screens */
   .screen { display: none; width: 100%; }
@@ -852,8 +1171,19 @@ const htmlUI = `<!DOCTYPE html>
     <div class="code-digits" id="codeDigits">----</div>
     <div class="code-hint">share with your partner</div>
   </div>
-  <div class="status-text pulse" id="roomStatus">Waiting for partner...</div>
-  <div class="events" id="events"></div>
+  <div class="sync-card">
+    <div class="sync-row">
+      <div class="state-indicator pulse" id="stateIcon">...</div>
+      <div class="state-copy">
+        <div class="status-text pulse" id="roomStatus">Waiting for partner...</div>
+        <div class="status-detail" id="roomDetail">Keep VLC open. Sync starts as soon as both of you are here.</div>
+      </div>
+    </div>
+  </div>
+  <div class="activity-title"><span>recent syncs</span><span id="activityCount">0 events</span></div>
+  <div class="events" id="events">
+    <div class="empty-feed">Play, pause, or seek in VLC and the latest sync actions will appear here.</div>
+  </div>
   <button class="btn btn-ghost" onclick="window.go_quit && window.go_quit()">Quit</button>
 </div>
 
@@ -888,33 +1218,117 @@ function vlcStatus(ok, msg) {
   p.className = 'pill ' + (ok ? 'ok' : 'err');
   document.getElementById('pillTxt').textContent = msg;
 }
+function updateStatus(msg) {
+  const p = document.getElementById('pill');
+  p.className = 'pill ok';
+  document.getElementById('pillTxt').textContent = msg;
+}
 function roomCreated(code) {
   document.getElementById('codeDigits').textContent = code;
   document.getElementById('codeBox').style.display = 'block';
-  setStatus('Waiting for partner...', true);
+  resetActivity();
+  setStatus('Waiting for partner...', 'Share the code, then start the movie in VLC when they join.', '...', true);
   show('sRoom');
 }
 function roomJoined(code) {
-  setStatus('Connecting...', true);
+  document.getElementById('codeBox').style.display = 'none';
+  resetActivity();
+  setStatus('Joining room ' + code + '...', 'Checking the room and waiting for your partner connection.', '...', true);
   show('sRoom');
 }
-function partnerJoined() { setStatus('Partner connected ♥ Syncing...', false); }
+function partnerJoined() {
+  setStatus('Connected together', 'You can play, pause, or seek in VLC. Changes will sync both ways.', 'OK', false);
+}
+function partnerLeft() {
+  setStatus('Partner disconnected', 'The room is still open. Ask them to join again with the same code.', '!', true);
+  addActivity('recv', 'left', 'now');
+}
+function roomFull() {
+  setStatus('Room is already full', 'Check the code and try again, or create a fresh room.', '!', false);
+}
 
 function syncEvent(dir, event, time) {
-  setStatus(dir === 'recv' ? 'Partner ' + event + 'd ♥' : 'Synced ♥', false);
+  const info = eventInfo(event);
+  setStatus(dir === 'recv' ? info.partnerStatus : info.youStatus, 'Last sync at ' + time + '.', info.icon, false);
+  addActivity(dir, event, time);
+}
+
+function addActivity(dir, event, time) {
+  const info = eventInfo(event);
   const d = document.createElement('div');
   d.className = 'ev ' + dir;
-  d.textContent = (dir === 'sent' ? '↗ you' : '↙ them') + '  ' + event + '  ' + time;
+  d.innerHTML =
+    '<div class="ev-icon">' + info.icon + '</div>' +
+    '<div class="ev-main">' +
+      '<div class="ev-title">' + (dir === 'sent' ? info.youTitle : info.partnerTitle) + '</div>' +
+      '<div class="ev-meta">' + (dir === 'sent' ? 'sent to partner' : 'received from partner') + ' at ' + time + '</div>' +
+    '</div>';
   const log = document.getElementById('events');
+  const empty = log.querySelector('.empty-feed');
+  if (empty) empty.remove();
   log.prepend(d);
-  while (log.children.length > 4) log.lastChild.remove();
+  while (log.children.length > 3) log.lastChild.remove();
+  document.getElementById('activityCount').textContent = log.children.length + (log.children.length === 1 ? ' event' : ' events');
 }
-function showError(msg) { setStatus(msg, false); }
 
-function setStatus(msg, pulse) {
+function eventInfo(event) {
+  if (event === 'play') {
+    return {
+      icon: 'P',
+      youTitle: 'You started playback',
+      partnerTitle: 'Partner started playback',
+      youStatus: 'Playback shared',
+      partnerStatus: 'Partner pressed play'
+    };
+  }
+  if (event === 'pause') {
+    return {
+      icon: 'II',
+      youTitle: 'You paused the movie',
+      partnerTitle: 'Partner paused the movie',
+      youStatus: 'Pause shared',
+      partnerStatus: 'Partner paused'
+    };
+  }
+  if (event === 'left') {
+    return {
+      icon: '!',
+      youTitle: 'Connection changed',
+      partnerTitle: 'Partner left the room',
+      youStatus: 'Connection changed',
+      partnerStatus: 'Partner left'
+    };
+  }
+  return {
+    icon: '>>',
+    youTitle: 'You jumped to a new moment',
+    partnerTitle: 'Partner jumped to a new moment',
+    youStatus: 'Timeline matched',
+    partnerStatus: 'Partner changed the timeline'
+  };
+}
+function showError(msg) { setStatus(msg, 'Check your connection, VLC, or the room code.', '!', false); }
+
+function resetActivity() {
+  const log = document.getElementById('events');
+  log.innerHTML = '<div class="empty-feed">Play, pause, or seek in VLC and the latest sync actions will appear here.</div>';
+  document.getElementById('activityCount').textContent = '0 events';
+}
+
+function setStatus(msg, detail, icon, pulse) {
+  if (typeof detail === 'boolean') {
+    pulse = detail;
+    detail = '';
+    icon = pulse ? '...' : 'OK';
+  }
   const el = document.getElementById('roomStatus');
+  const detailEl = document.getElementById('roomDetail');
+  const iconEl = document.getElementById('stateIcon');
   el.textContent = msg;
   el.className = 'status-text' + (pulse ? ' pulse' : '');
+  detailEl.textContent = detail || 'Ready to keep both VLC players together.';
+  iconEl.textContent = icon || 'OK';
+  iconEl.className = 'state-indicator' + (pulse ? ' pulse' : '');
 }
 </script>
 </body>

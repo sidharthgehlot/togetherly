@@ -15,14 +15,22 @@ wss.on('connection', (ws) => {
       const msg = JSON.parse(data);
 
       if (msg.type === 'join') {
-        roomId = msg.room;
-        if (!rooms.has(roomId)) rooms.set(roomId, new Set());
-        rooms.get(roomId).add(ws);
-        console.log(`joined room "${roomId}" (${rooms.get(roomId).size} connected)`);
-        // Tell existing members their partner arrived
-        if (rooms.get(roomId).size > 1) {
-          for (const client of rooms.get(roomId)) {
-            if (client !== ws && client.readyState === WebSocket.OPEN) {
+        const requestedRoom = msg.room;
+        if (!rooms.has(requestedRoom)) rooms.set(requestedRoom, new Set());
+        const room = rooms.get(requestedRoom);
+
+        if (room.size >= 2 && !room.has(ws)) {
+          ws.send(JSON.stringify({ type: 'room_full' }));
+          return;
+        }
+
+        roomId = requestedRoom;
+        room.add(ws);
+        console.log(`joined room "${roomId}" (${room.size} connected)`);
+
+        if (room.size > 1) {
+          for (const client of room) {
+            if (client.readyState === WebSocket.OPEN) {
               client.send(JSON.stringify({ type: 'partner_joined' }));
             }
           }
@@ -43,8 +51,18 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     if (roomId && rooms.has(roomId)) {
-      rooms.get(roomId).delete(ws);
-      if (rooms.get(roomId).size === 0) rooms.delete(roomId);
+      const room = rooms.get(roomId);
+      room.delete(ws);
+      if (room.size === 0) {
+        rooms.delete(roomId);
+        return;
+      }
+
+      for (const client of room) {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify({ type: 'partner_left' }));
+        }
+      }
     }
   });
 });
